@@ -576,9 +576,7 @@ def plot_distance_distribution(axs, species_tree, gene_trees, muc, mus, label="o
         # log bin the distances
         bins = np.logspace(np.log10(muc*total_time), np.log10(mus*total_time), 30)
         hist, bins = np.histogram(dists, bins=bins, density=True)
-        bin_centers = (bins[1:] + bins[:-1]) / 2
-        bin_widths = bins[1:] - bins[:-1]
-        norm_hist = hist #/ bin_widths
+        bin_centers = np.sqrt(bins[1:] * bins[:-1])
 
         mu = np.linspace(muc*total_time, mus*total_time, 100)
         pdf = linear_pdf(mu, muc*total_time, mus*total_time)
@@ -595,7 +593,7 @@ def plot_distance_distribution(axs, species_tree, gene_trees, muc, mus, label="o
         elif len(axs.shape) == 2:
             ax = axs[i, 1]
         # plot the distance distribution
-        ax.plot(bin_centers, norm_hist, label=label)
+        ax.plot(bin_centers, hist, label=label)
         ax.set_xlabel("Evolutionary distance")
         ax.set_ylabel("Density")
         ax.plot(mu, pdf, color="red")
