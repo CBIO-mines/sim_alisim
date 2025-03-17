@@ -1,0 +1,22 @@
+# directories and files
+genomes_dir: "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/sim_genomes_rw_cherry"
+# Taxon csv is a csv file containing one line for each genome,
+# with columns : "genome" -> the fasta file name.
+# Other names are set further down, but columns must contain : the group it belongs to, and the (super) group to be plotted on the ggtree.
+taxon_csv: "taxon.csv"
+results_dir: "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/sim_genomes_rw_cherry_res"
+
+# run parameters
+max_threads: 1
+
+# scientific parameters
+muc: 6e-11 # minimum mutation rate
+mus: 5e-9 # maximum mutation rate
+aligner: "lastz"
+delta: 0.82 # 0.82 for lastz, 0.25 for mummer
+min_r_infl: 15 # the minimum -4 range to be considered not only -3
+
+# other settings
+cluster_name: "clade" # the name of the column of the taxon file that constitute groups to compare
+tree_annotation: "clade" # the name of the annotation to add to the ggtree 'heatmap'
+database_name: "mld.db" # your choice really
