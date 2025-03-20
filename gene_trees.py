@@ -174,7 +174,7 @@ def random_walk(mu, step, time, muc, mus, linear=False):
 
     if not linear:
         rw = np.exp(rw)
-    return np.mean(rw), rw
+    return np.mean(rw), rw, rw[-1]
 
 
 def get_random_walk_tree(tree, rw_step, mu, muc, mus):
@@ -200,9 +200,12 @@ def get_random_walk_tree(tree, rw_step, mu, muc, mus):
         return tree
     # initialize the mutation rate tree at mu
     mutation_rate_tree = tree.copy()
-    mutation_rate_tree.length = mu
-    for time_node, rate_node in zip(tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False)):
-         rate_node.length, _ = random_walk(rate_node.parent.length, rw_step, time_node.length, muc, mus, linear=False)
+    instant_mutation_rate_tree = tree.copy()
+    instant_mutation_rate_tree.length = mu
+    for time_node, rate_node, instant_rate_node in zip(tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False), instant_mutation_rate_tree.traverse(include_self=False)):
+        mean_mu, _, last_mu = random_walk(instant_rate_node.parent.length, rw_step, time_node.length, muc, mus)
+        rate_node.length = mean_mu
+        instant_rate_node.length = last_mu
     return mutation_rate_tree
 
 
