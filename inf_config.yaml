@@ -1,10 +1,10 @@
 # directories and files
-genomes_dir: "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/sim_genomes_rw_cherry"
+genomes_dir: "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/cherry_rw_x100_3_lowerbound/rw_v"
 # Taxon csv is a csv file containing one line for each genome,
 # with columns : "genome" -> the fasta file name.
 # Other names are set further down, but columns must contain : the group it belongs to, and the (super) group to be plotted on the ggtree.
 taxon_csv: "taxon.csv"
-results_dir: "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/sim_genomes_rw_cherry_res"
+results_dir: "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/cherry_rw_x100_3_lowerbound/res_rw_v"
 
 # run parameters
 max_threads: 1

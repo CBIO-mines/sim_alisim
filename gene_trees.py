@@ -31,6 +31,7 @@ import yaml
 # DONE : null model : rate changes after a constant time in the tree (Misha idea)
 # TODO : add no muc defined in all trees
 # TODO : the issue might be of correlation between A and B rates. But how ? there are enough steps in the random walk to make it uncorrelated
+# TODO : is the usage of .distance good in get average mutation rate ? It would be wrong in the case of the "mutation rate" tree
 # TODO : uncorrelated : ideas : white noise process (special case of gamma, Drummond 2006), Cox - Ingersoll - Ross process (lepage 2007), mixed relaxed clock (lartillot 2016), lognormal
 
 # Gene tree zone ---------------------------------------------------------------
@@ -149,7 +150,8 @@ def random_walk(mu, step, time, muc, mus, linear=False):
 
     if muc == None:
         lower_bound = False
-        muc = mu / 10
+        # just to define the step size don't worry
+        muc = mu / 100
     if not linear:
         rw[0] = np.log(mu)
         range_mu = np.log(mus) - np.log(muc)
@@ -161,7 +163,7 @@ def random_walk(mu, step, time, muc, mus, linear=False):
         mu_min = muc
         mu_max = mus
 
-    sigma = range_mu / 100
+    sigma = range_mu/100
     for i in range(1, n_steps):
         if np.random.random() > 0.5:
             rw[i] = rw[i - 1] + sigma
@@ -338,8 +340,12 @@ def generate_gene_trees(species_tree, n, muc, mus, beta=None, rw_step=None, time
             mu = fixed_mu
         elif muc:
             mu = np.random.uniform(muc, mus)
+            # or loguniform
+            # mu = np.exp(np.random.uniform(np.log(muc), np.log(mus)))
         else:
             mu = np.random.uniform(mus/100, mus)
+            # or loguniform
+            # mu = np.exp(np.random.uniform(np.log(mus/100), np.log(mus)))
         if beta:
             mutation_rate_tree = get_lognormal_rate_tree(gene_tree, beta, mu, muc, mus)
         elif rw_step:
@@ -400,30 +406,6 @@ def linear_cdf(mu, muc, mus):
     return np.where(mu < muc, 0, np.where(mu > mus, 1, (mu**2 - muc**2)/(mus**2 - muc**2)))
 
 
-def get_all_distances(gene_trees):
-    """
-    Get all the distances between tips of gene trees.
-
-    Parameters
-    ----------
-    gene_trees : list
-        The list of gene trees to get the distances from.
-
-    Returns
-    -------
-    dict
-        The dictionary of distances.
-    """
-    tips = [tip.name for tip in gene_trees[0].tips()]
-    distances = {}
-    for t1, t2 in itertools.combinations(tips, 2):
-        distances[(t1, t2)] = []
-        for gene_tree in gene_trees:
-            t1_node = gene_tree.find(t1)
-            t2_node = gene_tree.find(t2)
-            distances[(t1, t2)].append(t1_node.distance(t2_node))
-    return distances
-
 def get_average_mutation_rate(species_tree, tip_node):
     """
     Get the average mutation rate from the leaf to the root.
@@ -450,6 +432,63 @@ def get_average_mutation_rate(species_tree, tip_node):
         current_node = current_node.parent
     tree_height = species_tree.height()[0]
     return np.mean(mutation_rates) / tree_height
+
+
+def get_pair_mutation_rate(species_tree, tip_1, tip_2):
+    """
+    Get the average mutation rate to the lca of two tips.
+
+    Parameters
+    ----------
+    species_tree : TreeNode
+        The species tree to get the time distances from.
+    tip_1 : TreeNode
+        The first tip node of the gene tree to get the mutation rate from.
+    tip_2 : TreeNode
+        The second tip node of the gene tree to get the mutation rate from.
+
+    Returns
+    -------
+    list
+        The average mutation rate of each tip to the lca.
+    """
+    # as the time tree is ultrametric
+    lca_time_tree = species_tree.lca([species_tree.find(tip_1.name), species_tree.find(tip_2.name)])
+    time_tree_dist = lca_time_tree.height()[0]
+
+    lca_dist_tree = tip_1.lca([tip_1, tip_2])
+    tip_1_dist = tip_1.distance(lca_dist_tree)
+    tip_2_dist = tip_2.distance(lca_dist_tree)
+    return [tip_1_dist / time_tree_dist, tip_2_dist / time_tree_dist]
+
+
+def get_all_pair_mutation_rate(species_tree, gene_trees):
+    """
+    Get the average mutation rate to the lca of all pairs of tips.
+
+    Parameters
+    ----------
+    species_tree : TreeNode
+        The species tree to get the time distances from.
+    gene_trees : list
+        The list of gene trees to get the mutation rate from.
+
+    Returns
+    -------
+    dict
+        The dictionary of mutation rates.
+    """
+    tips_mut_rate = {}
+    tips = sorted([tip.name for tip in species_tree.tips()])
+    for gene_tree in gene_trees:
+        for tip_1, tip_2 in itertools.combinations(tips, 2):
+            if (tip_1, tip_2) not in tips_mut_rate:
+                tips_mut_rate[(tip_1, tip_2)] = []
+            tip_1_node = gene_tree.find(tip_1)
+            tip_2_node = gene_tree.find(tip_2)
+            tips_mut_rate[(tip_1, tip_2)].append(get_pair_mutation_rate(species_tree, tip_1_node, tip_2_node))
+    return tips_mut_rate
+
 
 
 def plot_mutation_rate_distribution(ax, species_tree, tip_name, gene_trees, muc, mus, label="observed"):
@@ -547,67 +586,107 @@ def plot_rate_correlation(ax, species_tree, gene_trees, tip_1, tip_2, muc, mus, 
 
 
 
-def plot_distance_distribution(axs, species_tree, gene_trees, muc, mus, label="observed", tree_dir=None):
+def plot_distance_distribution(axs, species_tree, gene_trees, muc_mus, label="observed distribution", tree_dir=None):
     """
     Plot the distribution of distances between tips of gene trees.
 
     Parameters
     ----------
+    axs : plt.Axes
+        The axes to plot on.
     species_tree : TreeNode
         The species tree to get the time distances from.
     gene_trees : list
         The list of gene trees to plot the distribution of distances from.
-    muc : float
-        The minimum mutation rate.
-    mus : float
-        The maximum mutation rate.
+    muc_mus : dict
+        The dict of muc and mus for each pair of tips.
 
     Returns
     -------
     None
     """
-    distances = get_all_distances(gene_trees)
-    n_combinations = len(distances)
+    tips_mut_rate = get_all_pair_mutation_rate(species_tree, gene_trees)
+    n_combinations = len(tips_mut_rate)
+    distances = {key: [(a + b)/2 for a, b in value] for key, value in tips_mut_rate.items()}
 
     # plot the distribution of distances/time
     for i, (pair, dists) in enumerate(distances.items()):
         # compute time distance between tips
+        muc, mus = muc_mus[pair]
         t1_node = species_tree.find(pair[0])
         t2_node = species_tree.find(pair[1])
         total_time = t1_node.distance(t2_node)
 
         # log bin the distances
-        bins = np.logspace(np.log10(muc*total_time), np.log10(mus*total_time), 30)
+        bins = np.logspace(np.log10(muc), np.log10(mus), 30)
         hist, bins = np.histogram(dists, bins=bins, density=True)
         bin_centers = np.sqrt(bins[1:] * bins[:-1])
 
-        mu = np.linspace(muc*total_time, mus*total_time, 100)
-        pdf = linear_pdf(mu, muc*total_time, mus*total_time)
+        # linear bin the distances
+        bins_lin = np.linspace(muc, mus, 30)
+        hist_lin, bins_lin = np.histogram(dists, bins=bins_lin, density=True)
+        bin_centers_lin = (bins_lin[1:] + bins_lin[:-1]) /2
 
-        # compute the KS statistic
-        # ks_res = kstest(dists, linear_cdf, args=(muc*total_time, mus*total_time))
-        # ks_stat = ks_res.statistic
-        # ks_where = ks_res.statistic_location
+        mu = np.logspace(np.log(muc), np.log(mus), 100, base=np.exp(1))
+        pdf = linear_pdf(mu, muc, mus)
+        pdf_log = np.where((mu >= muc) & (mu <= mus), np.log(mu)/(mu*(np.log(mus)**2 - np.log(muc)**2)), 0)
+
+        pdf_uniform = np.where((mu >= muc) & (mu <= mus), 1/(mus - muc), 0)
+        pdf_uniform_log = np.where((mu >= muc) & (mu <= mus),
+                                   1/(mu*(np.log(mus) - np.log(muc))), 0)
+
+
+
+        # correlation
+        correlation = np.corrcoef([a for a, _ in tips_mut_rate[pair]], [b for _, b in tips_mut_rate[pair]])[0, 1]
+
+        first_decile = np.percentile(np.array(dists), 10)
+        smallest_50 = [(a, b) for a, b in tips_mut_rate[pair] if (a + b) < first_decile]
+        correlation_smallest_50 = np.corrcoef([a for a, _ in smallest_50], [b for _, b in smallest_50])[0, 1]
+
+        last_decile = np.percentile(np.array(dists), 90)
+        highest_50 = [(a, b) for a, b in tips_mut_rate[pair] if (a + b) > last_decile]
+        correlation_highest_50 = np.corrcoef([a for a, _ in highest_50], [b for _, b in highest_50])[0, 1]
+
+
+        max_lastz_mu = 0.82/total_time
+        lastz_pairs = [(a, b) for a, b in tips_mut_rate[pair] if (a + b) < max_lastz_mu]
+        correlation_lastz = np.corrcoef([a for a, _ in lastz_pairs], [b for _, b in lastz_pairs])[0, 1]
+
 
         if n_combinations == 1:
-            ax = axs
+            ax = axs[0]
         elif len(axs.shape) == 1:
             ax = axs[i]
         elif len(axs.shape) == 2:
             ax = axs[i, 1]
         # plot the distance distribution
-        ax.plot(bin_centers, hist, label=label)
-        ax.set_xlabel("Evolutionary distance")
+        ax.scatter(bin_centers, hist, label=label)
+        ax.scatter(bin_centers_lin, hist_lin, label=f"{label} linear")
+        ax.set_xlabel("Effective mutation rate")
         ax.set_ylabel("Density")
-        ax.plot(mu, pdf, color="red")
+        ax.plot(mu, pdf, color="green", label="linear pdf")
+        # ax.plot(mu, pdf_log, color="darkgreen", label="linear pdf (log)")
+        ax.plot(mu, pdf_uniform, color="red", label="uniform pdf")
+        # ax.plot(mu, pdf_uniform_log, color="darkred", label="uniform pdf (log)")
+        ax.axvline(x=max_lastz_mu, color="purple", label="lastZ detection limit")
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.text(0.5, 0.1, f"{pair[0]} - {pair[1]} - {total_time:.1e}y", transform=ax.transAxes)
+        # ax.text(0.1, 0.5, f"Correlation : {correlation:.2f}", transform=ax.transAxes)#"\nCorrelation smallest 10% : {correlation_smallest_50:.2f}\nCorrelation highest 10% : {correlation_highest_50:.2f}", transform=ax.transAxes)
+        ax.text(0.2, 0.5, f"Correlation under lastz limit : {correlation_lastz:.2f}", transform=ax.transAxes)#"\nCorrelation smallest 10% : {correlation_smallest_50:.2f}\nCorrelation highest 10% : {correlation_highest_50:.2f}", transform=ax.transAxes)
+        ax.legend()
         # plot corresponding tree
         if n_combinations != 1:
-            if len(axs.shape) == 2 and tree_dir:
-                tip_ordered = sorted(pair)
+            tip_ordered = sorted(pair)
+            if len(axs.shape) == 2 and os.path.exists(f"{tree_dir}/{tip_ordered[0]}{tip_ordered[1]}.png"):
                 tree_img = mpimg.imread(f"{tree_dir}/{tip_ordered[0]}{tip_ordered[1]}.png")
+                axs[i, 0].imshow(tree_img)
+                axs[i, 0].axis("off")
+
+            # plot the same tree for all combinations
+            elif os.path.exists(f"{tree_dir}/tree.png"):
+                tree_img = mpimg.imread(f"{tree_dir}/tree.png")
                 axs[i, 0].imshow(tree_img)
                 axs[i, 0].axis("off")
 
@@ -905,7 +984,7 @@ def homologous_recombination(self, comp_node_dic):
         return self.root()
 
 
-def run_simulation(cfg):
+def run_simulation(cfg, ax=None):
     """
     Run a simulation of a species tree.
 
@@ -913,6 +992,8 @@ def run_simulation(cfg):
     ----------
     cfg : dict
         The configuration dictionary.
+    ax : plt.Axes
+        The axes to plot the distance distribution on.
 
     Returns
     -------
@@ -948,36 +1029,31 @@ def run_simulation(cfg):
         print("Unknown rate evolution")
         return None
 
-    n_combinations = len(list(itertools.combinations([tip.name for tip in gene_trees[0].tips()], 2)))
-    fig, axs = plt.subplots(n_combinations, 1, figsize=(10, 10))
-    if not muc:
-        all_mut_rates = []
-        for gene_tree in gene_trees:
-            mut_rate_tuple = (get_average_mutation_rate(time_tree, tip) for tip in gene_tree.tips())
-            all_mut_rates.append(sum(mut_rate_tuple))
-        if n_combinations == 1:
-            muc = np.min(all_mut_rates)
-            mus = np.max(all_mut_rates)
-        else:
-            sys.exit("Multiple combinations not implemented yet for undefined muc")
+    n_combinations = len(list(itertools.combinations([tip.name for tip in time_tree.tips()], 2)))
+    tips_mut_rate = get_all_pair_mutation_rate(time_tree, gene_trees)
 
-    print(f"muc : {muc:.2e}, mus : {mus:.2e}")
-    plot_distance_distribution(axs, time_tree, gene_trees, muc, mus)
-    fig.tight_layout()
-    fig.savefig(f"{cfg['outdir']}/distance_distribution.png")
     run_alisim_trees(gene_trees, cfg["outdir"], cfg["length_gene"], threads=cfg["threads"])
 
-    return muc, mus
+
+    if cfg["exp_mus"]:
+        mean_mus = {}
+        for pair, dists in tips_mut_rate.items():
+            mean_mus[pair] = [(a + b)/2 for a, b in dists]
+        muc_mus = {pair: [min(muss), max(muss)] for pair, muss in mean_mus.items()}
+    else:
+        muc_mus = {pair: [muc, mus] for pair in tips_mut_rate.keys()}
+
+    if ax is not None:
+        plot_distance_distribution(ax, time_tree, gene_trees, muc_mus, tree_dir="test_tree_repr")
+    else:
+        fig, axs = plt.subplots(n_combinations, 1, figsize=(10, 10))
+        plot_distance_distribution(axs, time_tree, gene_trees, plot_muc, plot_mus)
+        fig.tight_layout()
+        fig.savefig(f"{cfg['outdir']}/distance_distribution.png")
+
+    return tips_mut_rate
 
 
-
-
-
-TreeNode.set_color = set_color
-TreeNode.get_color = get_color
-TreeNode.get_timeline = get_timeline
-TreeNode.make_nodes_compatible = make_nodes_compatible
-TreeNode.homologous_recombination = homologous_recombination
 
 
 
@@ -998,7 +1074,7 @@ if __name__ == "__main__":
         # simpler rate evolution test
         cherry_tau = 1e8
         # beta = (np.log(mus) - np.log(muc)) / cherry_tau
-        rw_steps = [1e3, 1e4, 1e5]
+        rw_steps = [1e3, 1e4]
         # fixed_mu = np.random.uniform(muc, mus)
         cherry_species_tree = TreeNode.read([f"(A:{cherry_tau/2},B:{cherry_tau/2});"])
         fig, ax = plt.subplots()
@@ -1070,31 +1146,239 @@ if __name__ == "__main__":
 
 
 
-        # test lognormal truncated
-        # plot the correlation between child and parent rates for different values of beta fraction
-        # bf_gene_trees = {}
-        # correlation = {}
-        # for bf in beta_fraction:
-        #     beta = (np.log(mus) - np.log(muc)) / bf / tree_height
-        #     bf_gene_trees[bf] = generate_gene_trees(time_tree, 5000, muc, mus, beta=beta)
-        #     for gene_tree in bf_gene_trees[bf]:
-        #         for node in gene_tree.traverse(include_self=False):
-        #             correlation[bf] =
-
-
 
 
         # test random walk
-        n_rw = 10
+        n_rw = 1
+        muc = 6e-11
+        mus = 5e-9
         for _ in range(n_rw):
-            mean, rw = random_walk(np.random.uniform(muc, mus), 1e4, 1e8, None, mus, linear=False)
+            mean, rw, _ = random_walk(np.random.uniform(muc, mus), 1e4, 1e8, muc, mus, linear=False)
             plt.plot(rw)
             plt.axhline(y=mean, color="green")
             plt.axhline(y=mus, color="blue")
             plt.axhline(y=muc, color="blue")
         plt.yscale("log")
+        plt.savefig("random_walk_pres.png", dpi=300)
+        plt.close()
+
+        # test random walk distr
+        muc = 6e-11
+        mus = 5e-9
+        n_rw = 1e4
+        rw_steps_size = [1e2, 1e3, 1e4, 1e5]
+        tau = 1e8
+        fig, ax = plt.subplots()
+        for rw_step in rw_steps_size:
+            rw_distr = []
+            for _ in range(int(n_rw)):
+                mean, rw, last_rw = random_walk(np.random.uniform(muc, mus), tau/rw_step, 1e8, muc, mus, linear=False)
+                rw_distr.append(mean)
+            bins = np.logspace(np.log10(muc), np.log10(mus), 30)
+            bins_centers = np.sqrt(bins[1:]*bins[:-1])
+            hist, _ = np.histogram(rw_distr, bins=bins, density=True)
+            ax.plot(bins_centers, hist, label=f"number of steps : {rw_step:.0e}")
+        ax.legend()
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Mutation rate")
+        ax.set_ylabel("Density")
+        fig.savefig("random_walk_mean_distr.png", dpi=300)
         plt.show()
 
+        # exp muc random walk distr
+        muc = 6e-11
+        mus = 5e-9
+        tau = 2e8
+        rw_steps = tau/np.logspace(2, 5, 10)
+        n_rw = 5e3
+        fig, ax = plt.subplots()
+        exp_muc_list = []
+        batch_size = 500
+        for rw_step in rw_steps:
+            rw_distr = []
+            for i in range(2):
+                rw_distr.append([])
+                for _ in range(0, int(n_rw/2), batch_size):
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=10) as executor:
+                        res = list(executor.map(random_walk, [np.random.uniform(muc, mus) for _ in range(batch_size)], itertools.repeat(rw_step), itertools.repeat(tau), itertools.repeat(muc), itertools.repeat(mus), itertools.repeat(False)))
+                    for mean, _, _ in res:
+                        rw_distr[i].append(mean)
+            summed_rw_distr = np.array(rw_distr[0]) + np.array(rw_distr[1])
+            exp_muc = np.min(summed_rw_distr/2)
+            exp_muc_list.append({"step_size": rw_step, "exp_muc": exp_muc})
+        exp_muc_df = pd.DataFrame(exp_muc_list)
+        exp_muc_df["rw_step"] = exp_muc_df["step_size"].apply(lambda x: tau/x)
+
+        fig, ax = plt.subplots()
+        ax.scatter(exp_muc_df["rw_step"], exp_muc_df["exp_muc"], label="empirical muc")
+        ax.hlines(y=muc, xmin=0, xmax=1e5, label="muc")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Number of steps")
+        ax.set_ylabel("Mutation rate")
+        ax.legend()
+        fig.savefig("exp_muc_rw_steps.png", dpi=300)
+
+        # range mu random walk distr
+        muc = 6e-11
+        mus = 5e-9
+        tau = 2e8
+        number_of_steps = np.logspace(2, 5, 30)
+        rw_steps_size = tau/number_of_steps
+        n_rw = 5e3
+        fig, ax = plt.subplots()
+        exp_mu_list = []
+        batch_size = 500
+        for rw_step in rw_steps_size:
+            rw_distr = []
+            start_mus = np.random.uniform(muc, mus, batch_size)
+            for i in range(2):
+                rw_distr.append([])
+                for _ in range(0, int(n_rw), batch_size):
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=10) as executor:
+                        res = list(executor.map(random_walk, start_mus, [rw_step] * batch_size, [tau] * batch_size, [muc] *  batch_size, [mus] * batch_size, [False] * batch_size))
+                    for mean, _, _ in res:
+                        rw_distr[i].append(mean)
+            summed_rw_distr = np.array(rw_distr[0]) + np.array(rw_distr[1])
+            correlation = np.corrcoef(rw_distr[0], rw_distr[1])[0, 1]
+            exp_muc = np.min(summed_rw_distr/2)
+            exp_mus = np.max(summed_rw_distr/2)
+            exp_mu_list.append({"step_size": rw_step, "exp_muc": exp_muc, "exp_mus": exp_mus, "correlation": correlation})
+        exp_mu_df = pd.DataFrame(exp_mu_list)
+        exp_mu_df["steps_nb"] = exp_mu_df["step_size"].apply(lambda x: tau/x)
+        exp_mu_df["mu_ratio"] = exp_mu_df["exp_mus"] / exp_mu_df["exp_muc"]
+
+        fig1, ax1 = plt.subplots(figsize=(5, 5))
+        fig2, ax2 = plt.subplots(figsize=(5, 5))
+        ax1.scatter(exp_mu_df["steps_nb"], exp_mu_df["mu_ratio"], label="mu_max/mu_min")
+        ax2.scatter(exp_mu_df["steps_nb"], exp_mu_df["correlation"], label="correlation")
+        ax1.hlines(y=10, xmin=0, xmax=1e5, label="mu_max/mu_min = 10", color="tab:blue")
+        ax2.hlines(y=0.1, xmin=0, xmax=1e5, label="correlation = 0.1", color="tab:orange")
+        ax1.set_xscale("log")
+        ax2.set_xscale("log")
+        ax1.set_xlabel("Number of steps")
+        ax2.set_xlabel("Number of steps")
+        ax1.set_ylabel("mu_max/mu_min")
+        ax2.set_ylabel("Correlation")
+        ax1.legend()
+        ax2.legend()
+
+
+        fig1.savefig("exp_mu_rw_range.png", dpi=300)
+        fig2.savefig("exp_mu_rw_corr.png", dpi=300)
+
+
+
+
+
+        # test lognormal distr
+        muc = 6e-11
+        mus = 5e-9
+        time_tree_height = 2e8
+        test_tree = TreeNode.read(["(A:1,B:1);"])
+        time_tree = get_time_tree(test_tree, time_tree_height)
+        betas = np.logspace(-6, 2, 5)
+        tips_mut_distr = {beta: {} for beta in betas}
+        fig, axs = plt.subplots(len(betas), 3, figsize=(10, 10))
+        for i, beta  in enumerate(betas):
+            gene_trees = generate_gene_trees(time_tree, 1000, muc, mus, beta=beta, fixed_mu=1e-9)
+            tips_mut_distr[beta] = get_all_pair_mutation_rate(time_tree, gene_trees)
+            hist_bins = np.logspace(np.log10(muc), np.log10(mus), 30)
+            ax = axs[i, 0]
+            hist, bins = np.histogram([a for _, value in tips_mut_distr[beta].items() for a, _ in value], bins=hist_bins, density=True)
+            bins_centers = np.sqrt(bins[1:] * bins[:-1])
+            ax.plot(bins_centers, hist, label=f"beta : {beta:.2e}")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.legend()
+            ax.set_title(f"A, beta : {beta:.2e}")
+            ax.set_xlabel("Mutation rate")
+            ax.set_ylabel("Density")
+            ax = axs[i, 1]
+            hist, bins = np.histogram([b for _, value in tips_mut_distr[beta].items() for _, b in value], bins=hist_bins, density=True)
+            bins_centers = np.sqrt(bins[1:] * bins[:-1])
+            ax.plot(bins_centers, hist, label=f"beta : {beta:.2e}")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.legend()
+            ax.set_title(f"B, beta : {beta:.2e}")
+            ax.set_xlabel("Mutation rate")
+            ax.set_ylabel("Density")
+            plot_distance_distribution(axs[i, 2], time_tree, gene_trees, muc, mus)
+        fig.tight_layout()
+        plt.show()
+
+        # playing with truncnorm alone
+        muc = -1
+        mus = 1
+        loc = 0
+        scale = 0.5
+        rv = truncnorm((muc - loc) / scale, (mus - loc) / scale, loc=loc, scale=scale)
+        fig, ax = plt.subplots()
+        bins = np.linspace(muc, mus, 30)
+        rs = rv.rvs(100000)
+        hist, bins = np.histogram(rs, bins=bins, density=True)
+        bin_centers = (bins[1:] + bins[:-1]) / 2
+        ax.bar(bin_centers, hist, width=bins[1:] - bins[:-1], alpha=0.5)
+        ax.set_xlim(muc - 1, mus + 1)
+        plt.show()
+
+        # playing with truncnorm and logs
+        fig, ax = plt.subplots(1, 2)
+        ax1, ax2 = ax
+        muc = 6e-11
+        mus = 5e-9
+        loc = np.log(mus)
+        scale = 10
+        rv = truncnorm((np.log(muc) - loc) / scale, (np.log(mus) - loc) / scale, loc=loc, scale=scale)
+        x = np.linspace(np.log(muc), np.log(mus), 100)
+        bins = np.linspace(np.log(muc), np.log(mus), 30)
+        rs = rv.rvs(100000)
+        # rs_uniform = np.random.uniform(np.log(muc), np.log(mus), 100000)
+        ax1.hist(rs, bins=bins, alpha=0.5, density=True, label="truncnorm")
+        # ax1.hist(rs_uniform, bins=bins, alpha=0.5, density=True, label="uniform")
+        ax1.axvline(x=np.log(muc), color="blue")
+        ax1.axvline(x=np.log(mus), color="blue")
+        ax1.plot(x, rv.pdf(x), color="red")
+        ax1.legend()
+        # ax1.set_xlim(muc/10, mus*10)
+        ax2.hist(np.exp(rs), bins=np.logspace(np.log(muc), np.log(mus), 30, base=np.exp(1)), alpha=0.5, density=True, label="truncnorm")
+        # ax2.hist(np.exp(rs_uniform), bins=np.logspace(np.log(muc), np.log(mus), 30, base=np.exp(1)), alpha=0.5, density=True, label="uniform")
+        ax2.axvline(x=muc, color="blue")
+        ax2.axvline(x=mus, color="blue")
+        ax2.legend()
+        ax2.set_xscale("log")
+        # ax2.set_yscale("log")
+        fig.savefig("truncnorm_log_large_scale.png", dpi=300)
+
+        # comparing normal distribution and random walk
+        tau = 1e8
+        n_steps = 1e4
+        n_rw = 1000
+        muc = 6e-11
+        mus = 5e-9
+        start_mu = (muc + mus) / 2
+        range_mu = mus - muc
+        mean_rws = []
+        for _ in range(n_rw):
+            mean, rw, _ = random_walk(start_mu, n_steps, tau, muc, mus, linear=False)
+            mean_rws.append(mean)
+        mean_rws = np.array(mean_rws)
+        scale = range_mu / 8
+        rvs = truncnorm((muc - start_mu) / scale, (mus - start_mu) / scale, loc=start_mu, scale=scale).rvs(n_rw)
+        fig, ax = plt.subplots()
+        bins = np.logspace(np.log10(muc), np.log10(mus), 30)
+        hist, bins = np.histogram(mean_rws, bins=bins, density=True)
+        ax.hist(rvs, bins=bins, alpha=0.5, density=True, label="normal")
+        ax.hist(mean_rws, bins=bins, alpha=0.5, density=True, label="random walk")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.axvline(x=muc, color="blue")
+        ax.axvline(x=mus, color="blue")
+        ax.axvline(x=start_mu, color="green")
+        ax.legend()
+        fig.savefig("normal_vs_rw_log.png", dpi=300)
 
 
 
@@ -1102,6 +1386,7 @@ if __name__ == "__main__":
 
 
 
+       
 
 
 
@@ -1109,28 +1394,22 @@ if __name__ == "__main__":
 
 
 
+        # test plot_distance_distribution for rw corr 1e5 steps
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+        for i, steps in enumerate([3]):
+            print(f"steps : {steps}, i : {i}")
+            gene_trees = []
+            gene_tree_dir = f"/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/corr/rw_cherry_rw_1.00e+0{steps}"
+            for _ in range(1000):
+                gene_trees.append(TreeNode.read(f"{gene_tree_dir}/gene_tree_{_}.newick"))
+            species_tree = TreeNode.read([f"(A:1,B:1);"])
+            tree_height = 2e8
+            time_tree = get_time_tree(species_tree, tree_height)
+            all_mus = get_all_pair_mutation_rate(species_tree, gene_trees)
+            summed_mus = [a + b for a, b in all_mus[("A", "B")]]
+            muc = np.min(summed_mus)
+            mus = np.max(summed_mus)
 
 
+            plot_distance_distribution(ax, time_tree, gene_trees, muc, mus)
 
-
-
-
-        # HGT test
-        original_tree = tree.copy()
-        print(tree.ascii_art())
-        tree.set_color_tree("red")
-        timeline = []
-        tree.get_timeline(timeline, 0)
-        deduplicated_timeline = list(set(timeline))
-        print(deduplicated_timeline)
-
-        comp_node_dic = {i: [] for i in deduplicated_timeline}
-        tree.make_nodes_compatible(deduplicated_timeline, comp_node_dic, 0)
-        print(tree.ascii_art())
-        tree.set_node_compatible(comp_node_dic, 0)
-
-        # recombination
-        C = tree.find("C")
-        C.homologous_recombination()
-        tree.prune()
-        print(tree.ascii_art())
