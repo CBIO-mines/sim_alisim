@@ -310,7 +310,7 @@ def generate_cherries(species_tree, n, muc, mus):
     return cherries
 
 
-def generate_gene_trees(species_tree, n, muc, mus, beta=None, rw_step=None, timestep=None, fixed_mu=None):
+def generate_gene_trees(species_tree, n, muc, mus, beta=None, rw_step=None, timestep=None, fixed_mu=None, threads=1):
     """
     Generate gene trees from a species tree.
 
@@ -334,32 +334,39 @@ def generate_gene_trees(species_tree, n, muc, mus, beta=None, rw_step=None, time
     if not species_tree.is_root():
         print("Species tree is not at root")
         return gene_trees
-    for _ in range(n):
-        gene_tree = species_tree.copy()
-        if fixed_mu:
-            mu = fixed_mu
-        elif muc:
-            mu = np.random.uniform(muc, mus)
-            # or loguniform
-            # mu = np.exp(np.random.uniform(np.log(muc), np.log(mus)))
-        else:
-            mu = np.random.uniform(mus/100, mus)
-            # or loguniform
-            # mu = np.exp(np.random.uniform(np.log(mus/100), np.log(mus)))
-        if beta:
-            mutation_rate_tree = get_lognormal_rate_tree(gene_tree, beta, mu, muc, mus)
-        elif rw_step:
-            mutation_rate_tree = get_random_walk_tree(gene_tree, rw_step, mu, muc, mus)
-        elif timestep:
-            mutation_rate_tree = get_null_model_tree(gene_tree, timestep, mu, muc, mus)
-        else:
-            mutation_rate_tree = get_constant_rate_tree(gene_tree, mu)
 
-        # scale the gene tree with the mutation rate tree and the time species tree
+    gene_trees = [species_tree.copy() for _ in range(n)]
+    if fixed_mu:
+        mu = [fixed_mu] * n
+    elif muc:
+        mu = [np.random.uniform(muc, mus)] * n
+        # or loguniform
+        # mu = np.exp(np.random.uniform(np.log(muc), np.log(mus)))
+    else:
+        mu = [np.random.uniform(mus/100, mus)] * n
+        # or loguniform
+        # mu = np.exp(np.random.uniform(np.log(mus/100), np.log(mus)))
+    if beta:
+        mutation_rate_fun = get_lognormal_rate_tree
+        fun_args = [gene_trees, [beta]*n, mu, [muc] * n, [mus] * n]
+    elif rw_step:
+        mutation_rate_fun = get_random_walk_tree
+        fun_args = [gene_trees, [rw_step]*n, mu, [muc] * n, [mus] * n]
+    elif timestep:
+        mutation_rate_fun = get_null_model_tree
+        fun_args = [gene_trees, [timestep]*n, mu, [muc] * n, [mus] * n]
+    else:
+        mutation_rate_fun = get_constant_rate_tree
+        fun_args = [gene_trees, mu]
+
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as ex:
+        mutation_rate_trees = ex.map(mutation_rate_fun, *fun_args)
+    # scale the gene tree with the mutation rate tree and the time species tree
+    for gene_tree, mutation_rate_tree in zip(gene_trees, mutation_rate_trees):
         for gene_node, mutation_rate_node in zip(gene_tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False)):
             gene_node.length = gene_node.length * mutation_rate_node.length
 
-        gene_trees.append(gene_tree)
     return gene_trees
 
 
@@ -715,8 +722,10 @@ def run_alisim(gene_tree, outdir, length_gene, num):
     output_prefix = f"{outdir}/gene_tree_{num}"
     tree_path = f"{outdir}/gene_tree_{num}.newick"
     gene_tree.write(tree_path)
-    alisim_cmd = ["iqtree2", "--alisim", output_prefix, "-t", tree_path, "-m", "JC", "--out-format", "fasta", "--length", str(length_gene)]
+    alisim_cmd = ["iqtree", "--alisim", output_prefix, "-t", tree_path, "-m", "JC", "--out-format", "fasta", "--length", str(length_gene)]
     sp.run(alisim_cmd, check=True, capture_output=True)
+    os.remove(tree_path)
+    os.remove(f"{tree_path}.log")
 
 
 def run_alisim_trees(gene_trees, outdir, length_gene, threads=1):
@@ -754,6 +763,7 @@ def run_alisim_trees(gene_trees, outdir, length_gene, threads=1):
         assert set([seq.id for seq in seq_recs]) == set(seq_dic.keys())
         for seq in seq_recs:
             seq_dic[seq.id] += seq.seq
+        os.remove(seq_path)
     for name, seq in seq_dic.items():
         rec = SeqRecord(seq, id=name, description="")
         SeqIO.write(rec, f"{outdir}/{name}.fasta", "fasta")
@@ -1018,16 +1028,16 @@ def run_simulation(cfg, ax=None):
     species_tree = TreeNode.read([cfg["species_tree"]])
     time_tree = get_time_tree(species_tree, tree_height)
     if cfg["rate_evolution"] == "lognormal":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, beta=beta)
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, beta=beta, threads=cfg["threads"])
     elif cfg["rate_evolution"] == "random_walk":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, rw_step=rw_step)
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, rw_step=rw_step, threads=cfg["threads"])
     elif cfg["rate_evolution"] == "none":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus)
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, threads=cfg["threads"])
     elif len(species_tree.tips()) == 2 and cfg["rate_evolution"] == "none":
         gene_trees = generate_cherries(species_tree, cfg["n_gene_trees"], muc, mus)
     else:
         print("Unknown rate evolution")
-        return None
+        return {}
 
     n_combinations = len(list(itertools.combinations([tip.name for tip in time_tree.tips()], 2)))
     tips_mut_rate = get_all_pair_mutation_rate(time_tree, gene_trees)
