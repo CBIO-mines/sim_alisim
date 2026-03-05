@@ -123,7 +123,7 @@ def get_lognormal_rate_tree(tree, beta, mu, muc, mus):
 
 
 
-def random_walk(mu, step, time, muc, mus, linear=False):
+def random_walk(mu, rw_step, time, muc, mus, linear=False):
     """
     Generate a random walk with a given step size.
 
@@ -131,8 +131,8 @@ def random_walk(mu, step, time, muc, mus, linear=False):
     ----------
     mu : float
         The initial value of the mutation rate.
-    step : float
-        The step size of the random walk.
+    rw_step : float
+        The discrete time step size.
     time : float
         The total time of the branch.
     muc : float
@@ -145,7 +145,7 @@ def random_walk(mu, step, time, muc, mus, linear=False):
     float
         The mutation rate at the end of the branch.
     """
-    n_steps = int(time / step)
+    n_steps = int(time / rw_step)
     rw = np.zeros(n_steps)
 
     lower_bound = True
@@ -165,7 +165,9 @@ def random_walk(mu, step, time, muc, mus, linear=False):
         mu_min = muc
         mu_max = mus
 
+    # TODO is there something better?
     sigma = range_mu/100
+    # sigma = 0.1
     for i in range(1, n_steps):
         if np.random.random() > 0.5:
             rw[i] = rw[i - 1] + sigma
@@ -690,7 +692,7 @@ def plot_distance_distribution(axs, species_tree, gene_trees, muc_mus, label="ob
         total_time = t1_node.distance(t2_node)
 
         # log bin the distances
-        bins = np.logspace(np.log10(muc), np.log10(mus), 30)
+        bins = np.logspace(np.log10(muc), np.log10(mus), 20)
         hist, bins = np.histogram(dists, bins=bins, density=True)
         bin_centers = np.sqrt(bins[1:] * bins[:-1])
 
@@ -726,30 +728,32 @@ def plot_distance_distribution(axs, species_tree, gene_trees, muc_mus, label="ob
         correlation_lastz = np.corrcoef([a for a, _ in lastz_pairs], [b for _, b in lastz_pairs])[0, 1]
 
 
-        if n_combinations == 1:
+        if not isinstance(axs, np.ndarray):
+            ax = axs
+        elif n_combinations == 1:
             ax = axs[0]
         elif len(axs.shape) == 1:
             ax = axs[i]
         elif len(axs.shape) == 2:
-            ax = axs[i, 1]
+            ax = axs[i, 0]
         # plot the distance distribution
         ax.scatter(bin_centers, hist, label=label)
-        ax.scatter(bin_centers_lin, hist_lin, label=f"{label} linear")
+        # ax.scatter(bin_centers_lin, hist_lin, label=f"{label} linear")
         ax.set_xlabel("Effective mutation rate")
         ax.set_ylabel("Density")
         ax.plot(mu, pdf, color="green", label="linear pdf")
         # ax.plot(mu, pdf_log, color="darkgreen", label="linear pdf (log)")
         ax.plot(mu, pdf_uniform, color="red", label="uniform pdf")
         # ax.plot(mu, pdf_uniform_log, color="darkred", label="uniform pdf (log)")
-        ax.axvline(x=max_lastz_mu, color="purple", label="lastZ detection limit")
+        # ax.axvline(x=max_lastz_mu, color="purple", label="lastZ detection limit")
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.text(0.5, 0.1, f"{pair[0]} - {pair[1]} - {total_time:.1e}y", transform=ax.transAxes)
+        # ax.text(0.5, 0.1, f"{pair[0]} - {pair[1]} - {total_time:.1e}y", transform=ax.transAxes)
         # ax.text(0.1, 0.5, f"Correlation : {correlation:.2f}", transform=ax.transAxes)#"\nCorrelation smallest 10% : {correlation_smallest_50:.2f}\nCorrelation highest 10% : {correlation_highest_50:.2f}", transform=ax.transAxes)
-        ax.text(0.2, 0.5, f"Correlation under lastz limit : {correlation_lastz:.2f}", transform=ax.transAxes)#"\nCorrelation smallest 10% : {correlation_smallest_50:.2f}\nCorrelation highest 10% : {correlation_highest_50:.2f}", transform=ax.transAxes)
+        # ax.text(0.2, 0.5, f"Correlation under lastz limit : {correlation_lastz:.2f}", transform=ax.transAxes)#"\nCorrelation smallest 10% : {correlation_smallest_50:.2f}\nCorrelation highest 10% : {correlation_highest_50:.2f}", transform=ax.transAxes)
         ax.legend()
         # plot corresponding tree
-        if n_combinations != 1:
+        if n_combinations != 1 and False:
             tip_ordered = sorted(pair)
             if len(axs.shape) == 2 and os.path.exists(f"{tree_dir}/{tip_ordered[0]}{tip_ordered[1]}.png"):
                 tree_img = mpimg.imread(f"{tree_dir}/{tip_ordered[0]}{tip_ordered[1]}.png")
@@ -1121,20 +1125,17 @@ def run_simulation(cfg, ax=None):
     n_combinations = len(list(itertools.combinations([tip.name for tip in time_tree.tips()], 2)))
     tips_mut_rate = get_all_pair_mutation_rate(time_tree, gene_trees)
 
-    run_alisim_trees(gene_trees, cfg["outdir"], cfg["length_gene"], threads=cfg["threads"])
+    run_alisim_trees(gene_trees, cfg["genomes_dir"], cfg["length_gene"], threads=cfg["threads"])
 
-
-    if cfg["exp_mus"]:
-        mean_mus = {}
-        for pair, dists in tips_mut_rate.items():
-            mean_mus[pair] = [(a + b)/2 for a, b in dists]
-        muc_mus = {pair: [min(muss), max(muss)] for pair, muss in mean_mus.items()}
-    else:
-        muc_mus = {pair: [muc, mus] for pair in tips_mut_rate.keys()}
+    mean_mus = {}
+    for pair, dists in tips_mut_rate.items():
+        mean_mus[pair] = [(a + b)/2 for a, b in dists]
+    muc_mus = {pair: [min(muss), max(muss)] for pair, muss in mean_mus.items()}
 
     if ax is not None:
         plot_distance_distribution(ax, time_tree, gene_trees, muc_mus, tree_dir="test_tree_repr")
     else:
+        return tips_mut_rate
         fig, axs = plt.subplots(n_combinations, 1, figsize=(10, 10))
         plot_distance_distribution(axs, time_tree, gene_trees, plot_muc, plot_mus)
         fig.tight_layout()

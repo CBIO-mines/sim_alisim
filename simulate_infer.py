@@ -1,30 +1,47 @@
 #!/usr/bin/env python3
 
 import argparse
+import concurrent.futures
+import cProfile
 import itertools
 import os
+import pstats
 import sys
+import time
+import tracemalloc
 
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from skbio import TreeNode
 import yaml
 
+SERVER_MODE = False
+
+RATE_EVOLUTION_DIC = {
+    "random_walk": "rw_step_fraction",
+    "kishino": "nu",
+    "none": "none"
+}
+
 script_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(script_dir)
-mosaic_method_path = "/home/paulimer/Documents/test_florian/"
-sys.path.append(mosaic_method_path)
+if SERVER_MODE:
+    mosaic_method_path = "/project/bacteria_mlds/test_florian/"
+else:
+    mosaic_method_path = "/home/paulimer/Documents/test_florian/"
 
+sys.path.append(mosaic_method_path)
 import gene_trees as gt
-from main_inference import run_inference
-from fit.fit import theoretical_mld, fit_params
+from theoretical_vs_simulated import ALIGNER_DELTA
+from fitting.fun import theoretical_mld, fit_params
 from parse.fun import bin_mld
 from parse import fun as parse_fun
 from lastz_parallel_db import utils as lastz_utils
 
 
-import synthetic_mld as smld
+# TODO: concatenate all binned mld in a single df/csv, all the db in a single db, etc
 
 def inf_add_suffix(inference_cfg, suffix):
     for key in inference_cfg:
@@ -32,7 +49,50 @@ def inf_add_suffix(inference_cfg, suffix):
             inference_cfg[key] = inference_cfg[key] + suffix
 
 
-def simplified_inference(cfg, genomes_dir=None):
+def extract_pairwise_cherries(simulation_cfg):
+    """Extracts the different pairwise "cherries" of a given tree, to simulate and infer a baseline."""
+    time_tree = TreeNode.read([simulation_cfg["species_tree"]])
+    pairs = itertools.combinations([tip.name for tip in time_tree.tips()], 2)
+    cherries = []
+    for pair in pairs:
+        cherries.append(time_tree.shear(pair))
+    return cherries
+
+
+def make_cherry_conf(simulation_cfg, inference_cfg, cherry, names):
+    """Create a conf dic for running "control" cherries to compare to the baseline."""
+    cherry_sim_conf = simulation_cfg.copy()
+    cherry_sim_conf["species_tree"] = str(cherry)
+    cherry_sim_conf["outdir"] += f"_cherry_{'_vs_'.join(names)}_{simulation_cfg['tree_height']}"
+    cherry_sim_conf["rate_evolution"] = "random_walk"
+    cherry_sim_conf["tree_height"] = cherry.height()[0] / TreeNode.read([simulation_cfg["species_tree"]]).height()[0] * simulation_cfg["tree_height"]
+    cherry_inf_conf = inference_cfg.copy()
+    cherry_inf_conf["genomes_dir"] += f"_cherry_{'_vs_'.join(names)}_{simulation_cfg['tree_height']}"
+    cherry_inf_conf["results_dir"] += f"_cherry_{'_vs_'.join(names)}_{simulation_cfg['tree_height']}"
+    # print(cherry_sim_conf)
+    return cherry_sim_conf, cherry_inf_conf
+
+
+def cherries_inference(cfg, names):
+    """Just get me the binned mld bro."""
+    align_res = lastz_utils.align_exec([cfg["genomes_dir"] + f"/{names[0]}.fasta", cfg["genomes_dir"] + f"/{names[1]}.fasta"], "lastz", "bla")
+    unbinned_mld = align_res[2]["result"][0]
+    summed_mld = pd.DataFrame({"freq":unbinned_mld}, index=range(1, len(unbinned_mld) + 1)).reset_index(names="match_length")
+    binned_mld = parse_fun.bin_mld(
+            summed_mld,
+            linear_bin_width=3,
+            limit_size=30.5,
+            power_increment=0.1,
+            ncomp=1
+        )
+    return binned_mld
+
+
+
+def simplified_parsing(cfg, genomes_dir=None, cherry_inf=False):
+    """
+    Aligns, gathers MLDs and bins them.
+    """
 
     if not os.path.exists(cfg["taxon_csv"]):
         cfg["taxon_csv"] = os.path.join(cfg["genomes_dir"], cfg["taxon_csv"])
@@ -41,10 +101,9 @@ def simplified_inference(cfg, genomes_dir=None):
             sys.exit(1)
 
     masked_genomes_dir = cfg["genomes_dir"]
-    os.makedirs(cfg["results_dir"], exist_ok=True)
     # alignment
     print("Aligning genomes")
-    database_path = os.path.join(cfg["results_dir"], cfg["database_name"])
+    database_path = cfg["database_name"]
     if os.path.exists(database_path):
         update_db = True
     else:
@@ -68,7 +127,7 @@ def simplified_inference(cfg, genomes_dir=None):
     binned_mlds = {}
     for level in levels:
         genome_comps = parse_fun.get_genome_comp(level, cfg["taxon_csv"], "", cfg["cluster_name"], output_csv=False)
-        full_mld = parse_fun.get_all_mlds(genome_comps, database_path, threads=cfg["max_threads"])
+        full_mld = parse_fun.get_all_mlds(genome_comps, database_path, threads=2)
         summed_mld = parse_fun.sum_mlds(full_mld)
         binned_mld = parse_fun.bin_mld(
             summed_mld,
@@ -79,40 +138,45 @@ def simplified_inference(cfg, genomes_dir=None):
         )
         binned_mlds[level] = binned_mld
 
-    os.makedirs(os.path.join(cfg["results_dir"], "binned_mlds"), exist_ok=True)
+    if cherry_inf:
+        # just return the mld
+        return binned_mlds[0]
+    return binned_mlds
+    os.makedirs(cfg["binned_mld"], exist_ok=True)
     for level in levels:
         binned_mlds[level].to_csv(
-            os.path.join(cfg["results_dir"], "binned_mlds", f"{level[0]}_{level[1]}.csv"),
+            os.path.join(cfg["binned_mld"], f"{level[0]}_{level[1]}.csv"),
             index=False
         )
 
 
-
-
-
-def plot_mld_fit_and_expected(ax, res_dir, empirical_muc, empirical_mus, delta, simulated_params, summed_mu_array, tips_mut_rate, genome_length, level, save_res=None, outfile=None, plotminus4=False):
-    """Plots the fit of the mosaic model to the MLDs and the expected MLD given the simulation parameters."""
-
-    # get expected and fitted MLDs
-    binned_mld = pd.read_csv(os.path.join(res_dir, f"binned_mlds/{level[0]}_{level[1]}.csv"))
-
+def fit_mld(binned_mld, empirical_muc, empirical_mus, delta, genome_length, level, minus_4=True):
+    "Fits the mosaic model, returns the results of the optimisation."
+    print("OPENBLAS_NUM_THREADS", os.environ.get("OPENBLAS_NUM_THREADS"))
+    t0 = time.perf_counter()
     # mus and muc are different for each comp, need to refit here
     res_opt, _, res_opt_4 = fit_params(
         "dual-annealing",
-        np.array([8, -8]),
+        # "L-BFGS-B",
+        np.array([9, -8]),
         binned_mld["freq"],
         0.1,
         binned_mld["match_length"],
         empirical_mus,
         empirical_muc,
         delta,
-        genome_length
+        genome_length,
+        only_minus4=True
         )
-    if plotminus4:
-        fitted_params = res_opt_4.x
+    print(f"task done in{time.perf_counter() -t0}")
+    if minus_4:
+        return binned_mld, res_opt_4, level
     else:
-        fitted_params = res_opt.x
+        return binned_mld, res_opt, level
 
+
+def plot_mld_fit_and_expected(fitted_params, binned_mld, ax, empirical_muc, empirical_mus, delta, simulated_params, genome_length, level, save_res=None, outfile=None, plotminus4=True):
+    """Plots the fit of the mosaic model to the MLDs and the expected MLD given the simulation parameters."""
     if save_res:
         with open(save_res, "a") as f:
             f.write(f"{level[0]},{level[1]},{fitted_params[0]},{fitted_params[1]}\n")
@@ -135,9 +199,9 @@ def plot_mld_fit_and_expected(ax, res_dir, empirical_muc, empirical_mus, delta, 
     # synthetic_df = pd.DataFrame({"match_length": np.arange(1, 1001), "freq": synthetic_mld})
     # binned_synthetic_df = bin_mld(synthetic_df, 3, 30.5, 0.1, 1)
 
-    synthetic_mld_delta = smld.synthetic_mld(summed_mu_array, 10**simulated_params[0], 1000, 100, delta)
-    synthetic_df_delta = pd.DataFrame({"match_length": np.arange(1, 1001), "freq": synthetic_mld_delta})
-    binned_synthetic_df_delta = bin_mld(synthetic_df_delta, 3, 30.5, 0.1, 1)
+    # synthetic_mld_delta = smld.synthetic_mld(summed_mu_array, 10**simulated_params[0], 1000, 100, delta)
+    # synthetic_df_delta = pd.DataFrame({"match_length": np.arange(1, 1001), "freq": synthetic_mld_delta})
+    # binned_synthetic_df_delta = bin_mld(synthetic_df_delta, 3, 30.5, 0.1, 1)
 
 
     ax.plot(binned_mld["match_length"], binned_mld["freq"], 'o', label="Observed", color="black")
@@ -156,155 +220,171 @@ def plot_mld_fit_and_expected(ax, res_dir, empirical_muc, empirical_mus, delta, 
     ax.legend()
     ax.set_title(f"MLD fit for {level[0]} vs {level[1]}")
     ax.set_xlabel("Match length")
-    ax.set_ylabel("Frequency")
+    ax.set_ylabel("Normalized count")
     if outfile:
         plt.savefig(outfile)
-    return {"genome_1": level[0], "genome_2": level[1], "fit_tau": fitted_params[0], "sim_tau": simulated_params[0]}
+    return {"genome_1": level[0], "genome_2": level[1], "fit_tau": fitted_params[0], "sim_tau": simulated_params[0], "empirical_muc": empirical_muc, "empirical_mus": empirical_mus}
 
-
-def simulate_infer(simulation_cfg, inference_cfg):
-    if type(simulation_cfg["rw_step_fraction"]) is list and simulation_cfg["rate_evolution"] == "random_walk":
-        rw_step_fraction_list = simulation_cfg["rw_step_fraction"].copy()
-        if type(simulation_cfg["tree_height"]) is list:
-            tree_heights = simulation_cfg["tree_height"].copy()
-            tree_heights = [float(tree_height) for tree_height in tree_heights]
-        else:
-            tree_heights = [float(simulation_cfg["tree_height"])]
-        all_res_df_list = []
-        for tree_height in tree_heights:
-            print(f"Tree height: {tree_height}")
-            for rw_step_fraction in rw_step_fraction_list:
-                res_fit = []
-                simulation_cfg_copy = simulation_cfg.copy()
-                inference_cfg_copy = inference_cfg.copy()
-                simulation_cfg_copy["rw_step_fraction"] = rw_step_fraction
-                suffix = f"_height_{tree_height:.0e}_rw_{float(rw_step_fraction):.0e}"
-                inf_add_suffix(inference_cfg_copy, suffix)
-                inf_add_suffix(simulation_cfg_copy, suffix)
-                print("################################################")
-                print("Simulating gene trees and sequences Random walk " + str(rw_step_fraction))
-                print("################################################")
-                species_tree = TreeNode.read([simulation_cfg_copy["species_tree"]])
-                n_combinations = len(list(itertools.combinations(species_tree.tips(), 2)))
-                figaa, axaa = plt.subplots(n_combinations, 2, figsize=(15, 5*n_combinations))
-                simulation_cfg_copy["tree_height"] = tree_height
-                tips_mut_rate = gt.run_simulation(simulation_cfg_copy, axaa)
-                all_summed_mus = {}
-                simplified_inference(inference_cfg_copy)
-                for i, (pair, mut_rate) in enumerate(tips_mut_rate.items()):
-                    all_summed_mus[pair] = [(a + b)/2 for a, b in mut_rate]
-                    if simulation_cfg_copy["exp_mus"]:
-                        muc = np.min(all_summed_mus[pair])
-                        mus = np.max(all_summed_mus[pair])
-                    else:
-                        muc = float(simulation_cfg_copy["muc"])
-                        mus = float(simulation_cfg_copy["mus"])
-                    time_tree = gt.get_time_tree(species_tree, tree_height)
-                    sim_tau = time_tree.find(pair[0]).distance(time_tree.find(pair[1]))
-                    if n_combinations == 1:
-                        res_fit.append(plot_mld_fit_and_expected(
-                            axaa[1],
-                            inference_cfg_copy["results_dir"],
-                            muc, mus, inference_cfg_copy["delta"],
-                            (np.log10(sim_tau), -20),
-                            all_summed_mus[pair],
-                            mut_rate,
-                            simulation_cfg_copy["length_gene"]*simulation_cfg_copy["n_gene_trees"],
-                            pair,
-                            save_res=os.path.join(inference_cfg_copy["results_dir"], "fitted_params.csv"),
-                            plotminus4=True
-                        ))
-                    else:
-                        res_fit.append(plot_mld_fit_and_expected(
-                            axaa[i, 1],
-                            inference_cfg_copy["results_dir"],
-                            muc, mus, inference_cfg_copy["delta"],
-                            (np.log10(sim_tau), -20),
-                            all_summed_mus[pair],
-                            mut_rate,
-                            simulation_cfg_copy["length_gene"]*simulation_cfg_copy["n_gene_trees"],
-                            pair,
-                            save_res=os.path.join(inference_cfg_copy["results_dir"], "fitted_params.csv"),
-                            plotminus4=True
-                        ))
-
-                figaa.tight_layout()
-                figaa.savefig(os.path.join(inference_cfg_copy["results_dir"], "distr_fit_and_expected.png"), dpi=300)
-                res_fit_df = pd.DataFrame(res_fit)
-                res_fit_df["rw_step_fraction"] = rw_step_fraction
-                res_fit_df["tree_height"] = tree_height
-                all_res_df_list.append(res_fit_df)
-
-        all_res_fit_df = pd.concat(all_res_df_list).reset_index(drop=True)
-        all_res_fit_df.to_csv(os.path.join(os.path.dirname(inference_cfg["results_dir"]), "all_res_fit.csv"), index=False)
-
-
-    # elif type(simulation_cfg["beta_fraction"]) is list and simulation_cfg["rate_evolution"] == "lognormal":
-    #     # TODO obsolete
-    #     beta_fraction_list = simulation_cfg["beta_fraction"].copy()
-    #     for beta_fraction in beta_fraction_list:
-    #         simulation_cfg_copy = simulation_cfg.copy()
-    #         inference_cfg_copy = inference_cfg.copy()
-    #         simulation_cfg_copy["beta_fraction"] = beta_fraction
-    #         suffix = f"_ln_{float(beta_fraction):.2e}"
-    #         inf_add_suffix(inference_cfg_copy, suffix)
-    #         inf_add_suffix(simulation_cfg_copy, suffix)
-    #         print("################################################")
-    #         print("Simulating gene trees and sequences Lognormal " + str(beta_fraction))
-    #         print("################################################")
-    #         figaa, axaa = plt.subplots(1, 2, figsize=(10, 5))
-    #         tips_mut_rate = gt.run_simulation(simulation_cfg_copy, axaa[0])
-    #         all_summed_mus = {}
-    #         for pair, mut_rate in tips_mut_rate.items():
-    #             all_summed_mus[pair] = [(a + b)/2 for a, b in mut_rate]
-
-    #         muc = np.min(all_summed_mus[("A", "B")])
-    #         mus = np.max(all_summed_mus[("A", "B")])
-
-    #         print("Running inference")
-    #         inference_cfg["muc"] = muc
-    #         inference_cfg["mus"] = mus
-    #         run_inference(inference_cfg_copy)
-    #         plot_mld_fit_and_expected(
-    #             axaa[1],
-    #             inference_cfg_copy["results_dir"],
-    #             muc, mus, inference_cfg_copy["delta"],
-    #             (np.log10(2*float(simulation_cfg_copy["tree_height"])), -20),
-    #             all_summed_mus,
-    #             simulation_cfg_copy["length_gene"]*simulation_cfg_copy["n_gene_trees"],
-    #         )
-    #         figaa.tight_layout()
-    #         figaa.savefig(os.path.join(inference_cfg_copy["results_dir"], "fit_and_sim.png"))
-
+def simulate_infer(simulation_cfg, inference_cfg, tree_heights):
+    rate_evolution_parameter = RATE_EVOLUTION_DIC[simulation_cfg["rate_evolution"]]
+    if rate_evolution_parameter == "none":
+        rate_params = ["none"]
     else:
-        if simulation_cfg["rate_evolution"] == "random_walk":
-            print_info = "Random walk" + simulation_cfg["rw_step_fraction"]
-        elif simulation_cfg["rate_evolution"] == "lognormal":
-            print_info = "Lognormal" + simulation_cfg["beta_fraction"]
+        rate_params = simulation_cfg[rate_evolution_parameter].copy()
+    all_res_df_list = []
+    aligners = inference_cfg["aligner"].copy()
+    configs = [{"tree_height": th, "aligner": al, rate_evolution_parameter: rep} \
+               for th, al, rep in itertools.product(tree_heights, aligners, rate_params)]
+    file_names = [{"db_name":f"{simulation_cfg['outdir']}/dbs/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}.db",\
+                   "binned_mld_name":f"{simulation_cfg['outdir']}/binned_mlds/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_binned_mld/",\
+                   "fit_expected_name":f"{simulation_cfg['outdir']}/fit_expected_fig/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_fit_expected.png",\
+                   "genomes_dir":f"{simulation_cfg['outdir']}/genomes/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_genomes/"} \
+                  for conf in configs]
+    os.makedirs(os.path.join(simulation_cfg["outdir"], "dbs"), exist_ok=True)
+    os.makedirs(os.path.join(simulation_cfg["outdir"], "binned_mlds"), exist_ok=True)
+    os.makedirs(os.path.join(simulation_cfg["outdir"], "fit_expected_fig"), exist_ok=True)
+    os.makedirs(os.path.join(simulation_cfg["outdir"], "genomes"), exist_ok=True)
+    binned_mld_dic_of_dics = {}
+
+    species_tree = TreeNode.read([simulation_cfg["species_tree"]])
+    n_combinations = len(list(itertools.combinations(species_tree.tips(), 2)))
+    for conf, names in zip(configs, file_names):
+        print("################################################")
+        print(f"Currently working on {conf}")
+        print("################################################")
+        time_tree = gt.get_time_tree(species_tree, conf["tree_height"])
+        fig_fe, ax_fe = plt.subplots(n_combinations, 2, figsize=(10, 5*n_combinations))
+        if inference_cfg["also_cherries"] == "yes":
+            res_cherries = []
+            cherries = extract_pairwise_cherries(simulation_cfg_copy)
+            for cherry in cherries:
+                cherry_names = sorted([tip.name for tip in cherry.tips()])
+                cherry_sim_conf, cherry_inf_conf = make_cherry_conf(simulation_cfg_copy, inference_cfg_copy, cherry, cherry_names)
+                # print(cherry_sim_conf)
+                tips_mut_rate_cherry = gt.run_simulation(cherry_sim_conf)
+                # urgh c'est laid
+                summed_mus_cherry = [(a + b)/2 for a, b in tips_mut_rate_cherry[next(iter(tips_mut_rate_cherry))]]
+                binned_mld = cherries_inference(cherry_inf_conf, cherry_names)
+                _, res, _ = fit_mld(binned_mld,
+                                    np.min(summed_mus_cherry),
+                                    np.max(summed_mus_cherry),
+                                    cherry_inf_conf["delta"],
+                                    cherry_sim_conf["n_gene_trees"] * cherry_sim_conf["length_gene"],
+                                    " ".join(cherry_names),
+                                    True
+                                    )
+                cherry_time_tree = gt.get_time_tree(cherry, cherry_sim_conf["tree_height"])
+                cherry_1 = cherry_time_tree.find(cherry_names[0])
+                cherry_2 = cherry_time_tree.find(cherry_names[1])
+                sim_tau_cherry = cherry_1.distance(cherry_2)
+                res_cherries.append({"genome_1": cherry_names[0],
+                                     "genome_2": cherry_names[1],
+                                     "fit_tau_cherry": res.x[0],
+                                     "sim_tau_cherry": np.log10(sim_tau_cherry)})
+            cherries_df = pd.DataFrame(res_cherries)
+
+        #simulations
+        simulation_cfg_copy = simulation_cfg.copy()
+        simulation_cfg_copy["tree_height"] = conf["tree_height"]
+        simulation_cfg_copy[rate_evolution_parameter] = conf[rate_evolution_parameter]
+        simulation_cfg_copy["genomes_dir"] = names["genomes_dir"]
+        tips_mut_rate = gt.run_simulation(simulation_cfg_copy, ax_fe)
+
+        # parsing
+        inference_cfg_copy = inference_cfg.copy()
+        inference_cfg_copy["database_name"] = names["db_name"]
+        inference_cfg_copy["cluster_name"] = "clade"
+        inference_cfg_copy["genomes_dir"] = names["genomes_dir"]
+        inference_cfg_copy["binned_mld"] = names["binned_mld_name"]
+        inference_cfg_copy["aligner"] = conf["aligner"]
+        inference_cfg_copy["delta"] = ALIGNER_DELTA[conf["aligner"]]
+        key = tuple([(key, item) for key, item in conf.items()])
+        binned_mld_dic_of_dics[key] = simplified_parsing(inference_cfg_copy)
+
+        # fitting
+        # prepare lists of arguments for parallel execution
+        all_summed_mus = {pair: [(a + b)/2 for a, b in mut_rate] for pair, mut_rate in tips_mut_rate.items()}
+        sim_tau_list = {pair: np.log10(time_tree.find(pair[0]).distance(time_tree.find(pair[1]))) for pair in all_summed_mus.keys()}
+        if inference_cfg_copy["exp_mus"]:
+            muc_list = {pair: np.min(all_summed_mus[pair]) for pair in all_summed_mus.keys()}
+            mus_list = {pair: np.max(all_summed_mus[pair]) for pair in all_summed_mus.keys()}
         else:
-            print_info = simulation_cfg["rate_evolution"]
-        print("################################################")
-        print("Simulating gene trees and sequences " + print_info)
-        print("################################################")
-        figaa, axaa = plt.subplots(1, 2, figsize=(10, 5))
-        all_summed_mus = gt.run_simulation(simulation_cfg, axaa[0])
-        all_summed_mus = np.array(all_summed_mus)
-        muc = np.min(all_summed_mus)
-        mus = np.max(all_summed_mus)
-        print("Running inference")
-        inference_cfg["muc"] = muc
-        inference_cfg["mus"] = mus
-        run_inference(inference_cfg)
-        plot_mld_fit_and_expected(
-                axaa[1],
-                inference_cfg["results_dir"],
-                muc, mus, inference_cfg["delta"],
-                (np.log10(2*float(simulation_cfg["tree_height"])), -20),
-                all_summed_mus,
-                simulation_cfg["length_gene"]*simulation_cfg["n_gene_trees"],
-            )
-        figaa.tight_layout()
-        figaa.savefig(os.path.join(inference_cfg["results_dir"], "fit_and_sim.png"))
+            muc_list = {pair: float(simulation_cfg_copy["muc"]) for pair in all_summed_mus.keys()}
+            mus_list = {pair: float(simulation_cfg_copy["mus"]) for pair in all_summed_mus.keys()}
+
+        if n_combinations == 1:
+            ax2_list = {list(all_summed_mus.keys())[0]: ax_fe[1]}
+        else:
+            ax2_list = {pair: ax_fe[i, 1] for i, pair in enumerate(all_summed_mus.keys())}
+
+        res_fit = {}
+        overall_args = [(binned_mld_dic_of_dics[key][pair],
+                         muc_list[pair],
+                         mus_list[pair],
+                         inference_cfg_copy["delta"],
+                         simulation_cfg_copy["length_gene"]*simulation_cfg_copy["n_gene_trees"],
+                         pair,
+                         True) for pair in all_summed_mus.keys()]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=inference_cfg_copy["max_threads"]) as executor:
+            futures = [executor.submit(fit_mld, *args) for args in overall_args]
+            for future in concurrent.futures.as_completed(futures):
+                res_fit[future.result()[2]] = future.result()
+
+        # plotting
+        plot_res = []
+        for pair, (binned_mld, res_opt, pair) in res_fit.items():
+            plot_res.append(plot_mld_fit_and_expected(
+                res_opt.x,
+                binned_mld,
+                ax2_list[pair],
+                muc_list[pair],
+                mus_list[pair],
+                inference_cfg_copy["delta"],
+                (sim_tau_list[pair], -20),
+                simulation_cfg_copy["length_gene"]*simulation_cfg_copy["n_gene_trees"],
+                pair,
+                None,
+                None,
+                True
+            ))
+        fig_fe.tight_layout()
+        fig_fe.savefig(names["fit_expected_name"], dpi=300)
+        plt.close()
+
+        # saving
+        res_fit_df = pd.DataFrame(plot_res)
+        res_fit_df[rate_evolution_parameter] = conf[rate_evolution_parameter] 
+        res_fit_df["tree_height"] = conf["tree_height"]
+        all_res_df_list.append(res_fit_df)
+        if inference_cfg_copy["also_cherries"] == "yes":
+            res_fit_df = pd.merge(res_fit_df, cherries_df, on=["genome_1", "genome_2"], how="left")
+            print(res_fit_df)
+
+    all_res_fit_df = pd.concat(all_res_df_list).reset_index(drop=True)
+    all_res_fit_df.to_csv(os.path.join(simulation_cfg["outdir"], "all_res_fit.csv"), index=False)
+    all_binned_mlds = []
+    for conf, binned_mld_dic in binned_mld_dic_of_dics.items():
+        conf_binned_mld = []
+        for level, binned_mld in binned_mld_dic.items():
+            binned_mld["species_1"] = level[0]
+            binned_mld["species_2"] = level[1]
+            conf_binned_mld.append(binned_mld)
+        conf_binned_mld_df = pd.concat(conf_binned_mld)
+        for param, value in conf:
+            conf_binned_mld_df[param] = value
+        all_binned_mlds.append(conf_binned_mld_df)
+    all_binned_mlds_df = pd.concat(all_binned_mlds).reset_index(drop=True)
+    all_binned_mlds_df.to_csv(os.path.join(simulation_cfg["outdir"], "all_binned_mlds.csv"), index=False)
+            
+
+
+def main(simulation_cfg, inference_cfg):
+    if type(simulation_cfg["tree_height"]) is list:
+        tree_heights = simulation_cfg["tree_height"].copy()
+        tree_heights = [float(tree_height) for tree_height in tree_heights]
+    else:
+        tree_heights = [float(simulation_cfg["tree_height"])]
+    simulate_infer(simulation_cfg, inference_cfg, tree_heights)
 
 
 if __name__ == "__main__":
@@ -318,7 +398,15 @@ if __name__ == "__main__":
     with open(args.inference_cfg, "r") as f:
         inference_cfg = yaml.safe_load(f)
 
-    simulate_infer(simulation_cfg, inference_cfg)
+    tracemalloc.start()
+    with cProfile.Profile() as pr:
+        main(simulation_cfg, inference_cfg)
+        pstats.Stats(pr).sort_stats("cumtime").print_stats(50)
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics('lineno')
+    print("[ Top 10 ]")
+    for stat in top_stats[:10]:
+        print(stat)
 
     if False:
         # debug region
