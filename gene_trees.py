@@ -17,22 +17,24 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 import pandas as pd
-from scipy.stats import truncnorm, kstest, gmean, uniform
+from scipy.stats import norm, truncnorm, kstest, gmean, uniform, lognorm
+import seaborn as sns
 from skbio import TreeNode
 import yaml
 
 
-# DONE : write random walk function
-# DONE : generate scaled gene trees from a species tree
-# DONE : write lognormal function
-# DONE : write function to make rates vary through time
-# DONE : write random walk function
-# DONE : generate genomes and infer divergences
-# DONE : null model : rate changes after a constant time in the tree (Misha idea)
-# TODO : add no muc defined in all trees
-# TODO : the issue might be of correlation between A and B rates. But how ? there are enough steps in the random walk to make it uncorrelated
-# TODO : is the usage of .distance good in get average mutation rate ? It would be wrong in the case of the "mutation rate" tree
-# TODO : uncorrelated : ideas : white noise process (special case of gamma, Drummond 2006), Cox - Ingersoll - Ross process (lepage 2007), mixed relaxed clock (lartillot 2016), lognormal
+# DONE: write random walk function
+# DONE: generate scaled gene trees from a species tree
+# DONE: write lognormal function
+# DONE: write function to make rates vary through time
+# DONE: write random walk function
+# DONE: generate genomes and infer divergences
+# DONE: null model : rate changes after a constant time in the tree (Misha idea)
+# TODO: POURQUOI ÇA FITTE N'import quoie aaaaaaaaaaaahadd a collection of cherries base model if given a tree with more than two leaves. Of course the sequence of A in A-B comp and the sequence of A in A-C comp will have nothing in common.
+# TODO: add no muc defined in all trees
+# TODO: the issue might be of correlation between A and B rates. But how ? there are enough steps in the random walk to make it uncorrelated
+# TODO: is the usage of .distance good in get average mutation rate ? It would be wrong in the case of the "mutation rate" tree
+# TODO: uncorrelated : ideas : white noise process (special case of gamma, Drummond 2006), Cox - Ingersoll - Ross process (lepage 2007), mixed relaxed clock (lartillot 2016), lognormal
 
 # Gene tree zone ---------------------------------------------------------------
 def get_time_tree(tree, total_time):
@@ -179,7 +181,59 @@ def random_walk(mu, step, time, muc, mus, linear=False):
     return np.mean(rw), rw, rw[-1]
 
 
-def get_random_walk_tree(tree, rw_step, mu, muc, mus):
+def kishino_log_brownian(mu: float, nu: float, time: float) -> tuple[float, float]:
+    """
+    Makes a log Brownian motion according to Kishino et al 2001.
+
+    mu: float
+        the mutation rate at the start of the branch
+    nu: float
+        the autocorrelation parameter (0 => constant rate)
+    time: float
+        the length of the branch
+
+    This implementation has the annoying effect of making the variance of mutation rate increase with time.
+    """
+    # taking into account Jensen's inequality
+    s = nu * np.sqrt(time)
+    scale = mu / np.exp(s**2/2)
+    end_mu = lognorm.rvs(s=s, scale=scale)
+    # end_mu = lognorm.rvs(s=nu*np.sqrt(time), loc=mu)
+
+    branch_mu = (mu + end_mu) / 2
+    return end_mu, branch_mu
+
+
+def kishino_bounded_log_brownian(mu, nu, time, muc, mus):
+    """
+    Makes a log Brownian motion according to Kishino et al 2001.
+
+    mu: float
+        the mutation rate at the start of the branch
+    nu: float
+        the autocorrelation parameter (0 => constant rate)
+    time: float
+        the length of the branch
+    muc: float
+        the minimum mutation rate
+    mus: float
+        the maximum mutation rate
+
+    """
+    if nu == 0:
+        return mu, mu, 0
+    scale = nu * np.sqrt(time)
+    a = (np.log(muc) - np.log(mu) + scale**2 / 2) / scale
+    b = (np.log(mus) - np.log(mu) + scale**2 / 2) / scale
+    log_end_mu = truncnorm.rvs(a, b, loc=np.log(mu) - (nu**2) * time / 2, scale=scale)
+    end_mu = np.exp(log_end_mu)
+    branch_mu = (mu + end_mu) / 2
+    movement = mu - end_mu
+    return end_mu, branch_mu, movement
+
+
+
+def get_random_walk_tree(tree, rw_step, mu, muc, mus, return_instant=False, nu=0):
     """
     Get a "mutation rate" tree with a random walk rate variation.
 
@@ -205,49 +259,57 @@ def get_random_walk_tree(tree, rw_step, mu, muc, mus):
     instant_mutation_rate_tree = tree.copy()
     instant_mutation_rate_tree.length = mu
     for time_node, rate_node, instant_rate_node in zip(tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False), instant_mutation_rate_tree.traverse(include_self=False)):
-        mean_mu, _, last_mu = random_walk(instant_rate_node.parent.length, rw_step, time_node.length, muc, mus)
-        rate_node.length = mean_mu
+        mean_mu, _, last_mu = random_walk(instant_rate_node.parent.length, rw_step, time_node.length, muc, mus, True)
+        rate_node.length = (instant_rate_node.parent.length + last_mu) / 2
+        # rate_node.length = mean_mu
         instant_rate_node.length = last_mu
+
+    if return_instant:
+        return mutation_rate_tree, instant_mutation_rate_tree
     return mutation_rate_tree
 
 
-def null_model_mu(time, timestep, mu_start, muc, mus):
+def get_kishino_tree(tree: TreeNode, nu: float, mu: float, return_instant: bool=False) -> TreeNode:
     """
-    Get the mutation rate after a given time in the null model.
+    Get a "mutation rate" tree with a random walk rate variation.
 
     Parameters
     ----------
-    time : float
-        The time at which to get the mutation rate.
-    timestep : float
-        The time step at which the mutation rate changes.
-    mu_start : float
-        The initial mutation rate.
-    muc : float
-        The minimum mutation rate.
-    mus : float
-        The maximum mutation rate.
-
+    tree : TreeNode
+        The tree to copy.
+    nu : float
+        The divergence of the log Brownian.
+    mu : float
+        The "root" mutation rate.
 
     Returns
     -------
-    float
-        The mutation rate after the given time.
+    mutation_rate_tree : TreeNode
+        The mutation rate tree.
     """
-    if time < timestep:
-        return mu_start
-    else:
-        steps = int(time / timestep)
-        step_mus = np.zeros(steps)
-        for i in range(steps):
-            step_mus[i] = np.random.uniform(muc, mus)
-        return gmean(step_mus)
+    if not tree.is_root():
+        print("Tree is not at root")
+        return tree
+    # initialize the mutation rate tree at mu
+    mutation_rate_tree = tree.copy()
+    instant_mutation_rate_tree = tree.copy()
+    instant_mutation_rate_tree.length = mu
+    for time_node, rate_node, instant_rate_node in zip(tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False), instant_mutation_rate_tree.traverse(include_self=False)):
+        mean_mu, last_mu = kishino_log_brownian(instant_rate_node.parent.length, nu, time_node.length)
+        rate_node.length = mean_mu
+        # rate_node.length = mean_mu
+        instant_rate_node.length = last_mu
+
+    if return_instant:
+        return mutation_rate_tree, instant_mutation_rate_tree
+    return mutation_rate_tree
 
 
 
-def get_null_model_tree(time_tree, timestep, mu, muc, mus):
+
+def get_null_model_tree(time_tree, mu, muc, mus):
     """
-    Get a "mutation rate" tree with a null model rate variation.
+    Get a mutation rate tree with pnas rate variation.
 
     Parameters
     ----------
@@ -274,7 +336,7 @@ def get_null_model_tree(time_tree, timestep, mu, muc, mus):
     mutation_rate_tree = time_tree.copy()
     mutation_rate_tree.length = mu
     for time_node, rate_node in zip(time_tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False)):
-        rate_node.length = null_model_mu(time_node.length, timestep, rate_node.parent.length, muc, mus)
+        rate_node.length = np.random.uniform(muc, mus)
 
     return mutation_rate_tree
 
@@ -300,17 +362,17 @@ def generate_cherries(species_tree, n, muc, mus):
         The list of cherries.
     """
     cherries = []
-    for _ in range(n):
-        mu_a = np.random.uniform(muc, mus)
-        mu_b = np.random.uniform(muc, mus)
+    mu_a = np.random.uniform(muc, mus, n)
+    mu_b = np.random.uniform(muc, mus, n)
+    for i in range(n):
         cherry = species_tree.copy()
-        cherry.find("A").length = mu_a*cherry.find("A").length
-        cherry.find("B").length = mu_b*cherry.find("B").length
+        cherry.find("A").length = mu_a[i]*cherry.find("A").length
+        cherry.find("B").length = mu_b[i]*cherry.find("B").length
         cherries.append(cherry)
     return cherries
 
 
-def generate_gene_trees(species_tree, n, muc, mus, beta=None, rw_step=None, timestep=None, fixed_mu=None, threads=1):
+def generate_gene_trees(species_tree, n, muc=None, mus=None, beta=None, rw_step=None, null=False, fixed_mu=None, nu=None, threads=1):
     """
     Generate gene trees from a species tree.
 
@@ -339,22 +401,25 @@ def generate_gene_trees(species_tree, n, muc, mus, beta=None, rw_step=None, time
     if fixed_mu:
         mu = [fixed_mu] * n
     elif muc:
-        mu = [np.random.uniform(muc, mus)] * n
+        mu = np.random.uniform(muc, mus, n)
         # or loguniform
         # mu = np.exp(np.random.uniform(np.log(muc), np.log(mus)))
     else:
-        mu = [np.random.uniform(mus/100, mus)] * n
+        mu = np.random.uniform(mus/100, mus, n)
         # or loguniform
         # mu = np.exp(np.random.uniform(np.log(mus/100), np.log(mus)))
     if beta:
         mutation_rate_fun = get_lognormal_rate_tree
         fun_args = [gene_trees, [beta]*n, mu, [muc] * n, [mus] * n]
+    if nu:
+        mutation_rate_fun = get_kishino_tree
+        fun_args = [gene_trees, [nu]*n, mu]
     elif rw_step:
         mutation_rate_fun = get_random_walk_tree
         fun_args = [gene_trees, [rw_step]*n, mu, [muc] * n, [mus] * n]
-    elif timestep:
+    elif null:
         mutation_rate_fun = get_null_model_tree
-        fun_args = [gene_trees, [timestep]*n, mu, [muc] * n, [mus] * n]
+        fun_args = [gene_trees, mu, [muc] * n, [mus] * n]
     else:
         mutation_rate_fun = get_constant_rate_tree
         fun_args = [gene_trees, mu]
@@ -1012,6 +1077,7 @@ def run_simulation(cfg, ax=None):
     """
     mus = float(cfg["mus"])
     muc = cfg["muc"]
+    print(f"muc : {muc}, mus : {mus}")
     try:
         muc = float(muc)
     except ValueError:
@@ -1021,20 +1087,33 @@ def run_simulation(cfg, ax=None):
     else:
         range_mu = np.log(mus) - np.log(mus/100)
     tree_height = float(cfg["tree_height"])
-    beta = range_mu/float(cfg["beta_fraction"])/tree_height
-    rw_step = tree_height/float(cfg["rw_step_fraction"])
+    try:
+        beta = range_mu/float(cfg["beta_fraction"])/tree_height
+    except KeyError:
+        pass
+    try:
+        rw_step = tree_height/float(cfg["rw_step_fraction"])
+    except KeyError:
+        pass
+    try:
+        nu = float(cfg["nu"])
+    except KeyError:
+        pass
+
     os.makedirs(cfg["outdir"], exist_ok=True)
 
     species_tree = TreeNode.read([cfg["species_tree"]])
     time_tree = get_time_tree(species_tree, tree_height)
     if cfg["rate_evolution"] == "lognormal":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, beta=beta, threads=cfg["threads"])
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, beta=beta, threads=cfg["threads"])
     elif cfg["rate_evolution"] == "random_walk":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, rw_step=rw_step, threads=cfg["threads"])
-    elif cfg["rate_evolution"] == "none":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc, mus, threads=cfg["threads"])
-    elif len(species_tree.tips()) == 2 and cfg["rate_evolution"] == "none":
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, rw_step=rw_step, threads=cfg["threads"])
+    elif cfg["rate_evolution"] == "kishino":
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, nu=nu, threads=cfg["threads"])
+    elif len(list(species_tree.tips())) == 2 and cfg["rate_evolution"] == "none":
         gene_trees = generate_cherries(species_tree, cfg["n_gene_trees"], muc, mus)
+    elif cfg["rate_evolution"] == "none":
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, threads=cfg["threads"])
     else:
         print("Unknown rate evolution")
         return {}
