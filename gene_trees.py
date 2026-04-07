@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # Trying to implement the same thing with monkey patching
+from simulate_infer import to_list
 
 import argparse
 import concurrent.futures
@@ -89,40 +90,6 @@ def get_constant_rate_tree(tree, mu):
     return mutation_rate_tree
 
 
-def get_lognormal_rate_tree(tree, beta, mu, muc, mus):
-    """
-    Get a "mutation rate" tree with an autocorrelated lognormal rate variation.
-
-    Parameters
-    ----------
-    tree : TreeNode
-        The tree to copy.
-    beta : float
-        The autocorrelation parameter.
-    mu : float
-        The "root" mutation rate.
-
-    Returns
-    -------
-    mutation_rate_tree : TreeNode
-        The mutation rate tree.
-    """
-    if not tree.is_root():
-        print("Tree is not at root")
-        return tree
-    # initialize the mutation rate tree at mu
-    mutation_rate_tree = tree.copy()
-    mutation_rate_tree.length = mu
-    for time_node, rate_node in zip(tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False)):
-        scale = beta * time_node.length
-        muc_trunc = (np.log(muc) - np.log(rate_node.parent.length)) / scale
-        mus_trunc = (np.log(mus) - np.log(rate_node.parent.length)) / scale
-        log_new_mu = truncnorm.rvs(muc_trunc, mus_trunc, loc=np.log(rate_node.parent.length), scale=scale)
-        rate_node.length = np.exp(log_new_mu)
-    return mutation_rate_tree
-
-
-
 def random_walk(mu, rw_step, time, muc, mus, linear=False):
     """
     Generate a random walk with a given step size.
@@ -193,17 +160,15 @@ def kishino_log_brownian(mu: float, nu: float, time: float) -> tuple[float, floa
         the autocorrelation parameter (0 => constant rate)
     time: float
         the length of the branch
-
-    This implementation has the annoying effect of making the variance of mutation rate increase with time.
     """
     # taking into account Jensen's inequality
     s = nu * np.sqrt(time)
     scale = mu / np.exp(s**2/2)
-    end_mu = lognorm.rvs(s=s, scale=scale)
+    last_mu = lognorm.rvs(s=s, scale=scale)
     # end_mu = lognorm.rvs(s=nu*np.sqrt(time), loc=mu)
 
-    branch_mu = (mu + end_mu) / 2
-    return end_mu, branch_mu
+    mean_mu = (mu + last_mu) / 2
+    return last_mu, mean_mu
 
 
 def kishino_bounded_log_brownian(mu, nu, time, muc, mus):
@@ -235,7 +200,7 @@ def kishino_bounded_log_brownian(mu, nu, time, muc, mus):
 
 
 
-def get_random_walk_tree(tree, rw_step, mu, muc, mus, return_instant=False, nu=0):
+def get_random_walk_tree(tree, rw_step, mu, muc, mus, mean_steps=False, return_instant=False):
     """
     Get a "mutation rate" tree with a random walk rate variation.
 
@@ -261,9 +226,13 @@ def get_random_walk_tree(tree, rw_step, mu, muc, mus, return_instant=False, nu=0
     instant_mutation_rate_tree = tree.copy()
     instant_mutation_rate_tree.length = mu
     for time_node, rate_node, instant_rate_node in zip(tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False), instant_mutation_rate_tree.traverse(include_self=False)):
-        mean_mu, _, last_mu = random_walk(instant_rate_node.parent.length, rw_step, time_node.length, muc, mus, True)
-        rate_node.length = (instant_rate_node.parent.length + last_mu) / 2
-        # rate_node.length = mean_mu
+        if not mean_steps:
+            mean_mu, _, last_mu = random_walk(instant_rate_node.parent.length, rw_step, time_node.length, muc, mus, True)
+            rate_node.length = (instant_rate_node.parent.length + last_mu) / 2
+        else:
+            mean_mu, _, last_mu = random_walk(instant_rate_node.parent.length, rw_step, time_node.length, muc, mus, True)
+            rate_node.length = mean_mu
+            
         instant_rate_node.length = last_mu
 
     if return_instant:
@@ -273,7 +242,7 @@ def get_random_walk_tree(tree, rw_step, mu, muc, mus, return_instant=False, nu=0
 
 def get_kishino_tree(tree: TreeNode, nu: float, mu: float, return_instant: bool=False) -> TreeNode:
     """
-    Get a "mutation rate" tree with a random walk rate variation.
+    Get a "mutation rate" tree with a rate variation according to Kishino et al 2001.
 
     Parameters
     ----------
@@ -297,7 +266,7 @@ def get_kishino_tree(tree: TreeNode, nu: float, mu: float, return_instant: bool=
     instant_mutation_rate_tree = tree.copy()
     instant_mutation_rate_tree.length = mu
     for time_node, rate_node, instant_rate_node in zip(tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False), instant_mutation_rate_tree.traverse(include_self=False)):
-        mean_mu, last_mu = kishino_log_brownian(instant_rate_node.parent.length, nu, time_node.length)
+        last_mu, mean_mu = kishino_log_brownian(instant_rate_node.parent.length, nu, time_node.length)
         rate_node.length = mean_mu
         # rate_node.length = mean_mu
         instant_rate_node.length = last_mu
@@ -337,7 +306,7 @@ def get_null_model_tree(time_tree, mu, muc, mus):
     # initialize the mutation rate tree at mu
     mutation_rate_tree = time_tree.copy()
     mutation_rate_tree.length = mu
-    for time_node, rate_node in zip(time_tree.traverse(include_self=False), mutation_rate_tree.traverse(include_self=False)):
+    for rate_node in mutation_rate_tree.traverse(include_self=False):
         rate_node.length = np.random.uniform(muc, mus)
 
     return mutation_rate_tree
@@ -374,7 +343,7 @@ def generate_cherries(species_tree, n, muc, mus):
     return cherries
 
 
-def generate_gene_trees(species_tree, n, muc=None, mus=None, beta=None, rw_step=None, null=False, fixed_mu=None, nu=None, threads=1):
+def generate_gene_trees(species_tree, n, muc=None, mus=None, rw_step=None, mean_steps=False, null=False, fixed_mu=None, nu=None, threads=1):
     """
     Generate gene trees from a species tree.
 
@@ -410,15 +379,15 @@ def generate_gene_trees(species_tree, n, muc=None, mus=None, beta=None, rw_step=
         mu = np.random.uniform(mus/100, mus, n)
         # or loguniform
         # mu = np.exp(np.random.uniform(np.log(mus/100), np.log(mus)))
-    if beta:
-        mutation_rate_fun = get_lognormal_rate_tree
-        fun_args = [gene_trees, [beta]*n, mu, [muc] * n, [mus] * n]
     if nu:
         mutation_rate_fun = get_kishino_tree
         fun_args = [gene_trees, [nu]*n, mu]
-    elif rw_step:
+    elif rw_step and not mean_steps:
         mutation_rate_fun = get_random_walk_tree
         fun_args = [gene_trees, [rw_step]*n, mu, [muc] * n, [mus] * n]
+    elif rw_step and mean_steps:
+        mutation_rate_fun = get_random_walk_tree
+        fun_args = [gene_trees, [rw_step]*n, mu, [muc] * n, [mus] * n, [True] * n]
     elif null:
         mutation_rate_fun = get_null_model_tree
         fun_args = [gene_trees, mu, [muc] * n, [mus] * n]
@@ -563,6 +532,11 @@ def get_all_pair_mutation_rate(species_tree, gene_trees):
             tips_mut_rate[(tip_1, tip_2)].append(get_pair_mutation_rate(species_tree, tip_1_node, tip_2_node))
     return tips_mut_rate
 
+
+def inner_mus(gene_trees, comp):
+    """
+    Computes the (immediate) mutation rate distribution at the lca of the specified node comparison.
+    """
 
 
 def plot_mutation_rate_distribution(ax, species_tree, tip_name, gene_trees, muc, mus, label="observed"):
@@ -1099,6 +1073,8 @@ def run_simulation(cfg, ax=None):
         rw_step = tree_height/float(cfg["rw_step_fraction"])
     except KeyError:
         pass
+    except TypeError:
+        pass
     try:
         nu = float(cfg["nu"])
     except KeyError:
@@ -1109,13 +1085,18 @@ def run_simulation(cfg, ax=None):
     species_tree = TreeNode.read([cfg["species_tree"]])
     time_tree = get_time_tree(species_tree, tree_height)
     if cfg["rate_evolution"] == "lognormal":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, beta=beta, threads=cfg["threads"])
+        sys.exit("not implemented anymore")
     elif cfg["rate_evolution"] == "random_walk":
-        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, rw_step=rw_step, threads=cfg["threads"])
+        if cfg["mean_steps"] == True:
+            gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, rw_step=rw_step, mean_steps=True, threads=cfg["threads"])
+        else:
+            gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, rw_step=rw_step, mean_steps=False, threads=cfg["threads"])
     elif cfg["rate_evolution"] == "kishino":
         gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, nu=nu, threads=cfg["threads"])
     elif len(list(species_tree.tips())) == 2 and cfg["rate_evolution"] == "none":
         gene_trees = generate_cherries(species_tree, cfg["n_gene_trees"], muc, mus)
+    elif cfg["rate_evolution"] == "null":
+        gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, null=True, threads=cfg["threads"])
     elif cfg["rate_evolution"] == "none":
         gene_trees = generate_gene_trees(time_tree, cfg["n_gene_trees"], muc=muc, mus=mus, threads=cfg["threads"])
     else:
@@ -1151,6 +1132,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Simulate gene trees.")
     parser.add_argument("config", help="The yaml configuration file.")
+    parser.add_argument("--nvruse", help="Trick.", action="store_true")
     args = parser.parse_args()
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
@@ -1158,34 +1140,112 @@ if __name__ == "__main__":
     run_simulation(cfg)
 
 
-    if False:
-        muc = None
-        mus = 5e-9
-        # simpler rate evolution test
+    if args.nvruse:
+        muc = 6e-13
+        mus = 1e-9
+        n_genes = 1e3
+        # all_mus = np.exp(np.random.uniform(np.log(muc), np.log(mus), size=int(n_genes)))
+        all_mus = [1e-10] * int(n_genes)
+        # all_mus = np.random.uniform(muc, mus, size=int(n_genes))
+        cherry_tau = 1
+        nus = np.logspace(-6, 0, 6)
+        # log normal test
+        end_mu_dic = {"rvs": [], "nu": []}
+        for nu in nus:
+            m = 1e-10
+            s = nu * np.sqrt(cherry_tau)
+            scale = m / np.exp(s**2/2)
+            end_mu_dic["rvs"] += list(lognorm.rvs(s=s, scale=scale, size=len(all_mus)))
+            end_mu_dic["nu"] += [nu]*len(all_mus)
+        lognorm_df = pd.DataFrame.from_dict(end_mu_dic)
+        for nu, nu_df in lognorm_df.groupby("nu"):
+            print(f"{nu} : mean {nu_df['rvs'].mean()}, std: {nu_df['rvs'].std()}")
+
+
+        g = sns.FacetGrid(data=lognorm_df, col="nu", col_wrap=3, sharex=False)#, hue="empirical")
+        g.map_dataframe(sns.histplot, x="rvs", bins=40)
+        plt.show()
+
+
+        # Kishino test
+        last_mu_nus = []
+        for nu in nus:
+            for mu in all_mus:
+                end_mu, _ = kishino_log_brownian(mu, nu, cherry_tau)
+                last_mu_nus.append({"nu": nu, "endmu": end_mu})
+
+        last_mu_df = pd.DataFrame(last_mu_nus)
+        for nu, nu_df in last_mu_df.groupby("nu"):
+            print(f"{nu} : {nu_df['endmu'].std()}")
+
+        # sns.displot(data=last_mu_df, x="endmu", col="nu", col_wrap=3, log_scale=True)#, kind="kde")
+        g = sns.FacetGrid(data=last_mu_df, col="nu", col_wrap=3, sharex=False)#, hue="empirical")
+        g.map_dataframe(plt.hist, x="endmu", bins=40)
+        plt.show()
+
+
+        # Kishino correlation/sum
+        muc = 6e-13
+        mus = 1e-9
+        n_genes = 1e3
+        all_mus = [np.exp(np.random.uniform(np.log(muc), np.log(mus)))] * int(n_genes)
         cherry_tau = 1e8
+        nus = np.logspace(-10, -4, 6)
+        # nu = np.linspace(10**-4.2, 10**-3.8, 8)
+        branch_mu_nus = []
+        for nu in nus:
+            for mu in all_mus:
+                # _, branch_mu_1, _ = kishino_bounded_log_brownian(mu, nu, cherry_tau, muc, mus)
+                # _, branch_mu_2, _ = kishino_bounded_log_brownian(mu, nu, cherry_tau, muc, mus)
+                _, branch_mu_1 = kishino_log_brownian(mu, nu, cherry_tau)
+                _, branch_mu_2 = kishino_log_brownian(mu, nu, cherry_tau)
+                branch_mu_nus.append({"nu": nu, "mu_1": branch_mu_1, "mu_2": branch_mu_2})
+        branch_mu_df = pd.DataFrame(branch_mu_nus)
+        branch_mu_df["summed_mu"] = branch_mu_df["mu_1"] + branch_mu_df["mu_2"]
+        # sns.displot(data=branch_mu_df, x="summed_mu", col="nu", col_wrap=3, log_scale=(True, True))#, stat="density")#, kind="kde")
+
+        g = sns.FacetGrid(data=branch_mu_df, col="nu", col_wrap=3)#, hue="empirical")
+        g.map_dataframe(plt.hist, x="summed_mu", bins=40)
+        g.map(plt.axvline, x=all_mus[0], ls='--', c='red')
+        plt.show()
+
+        # branch_mu_df = branch_mu_df.melt(id_vars=["nu"], value_vars=["mu_1", "mu_2"], value_name="Mutation rate")
+
+        # sns.displot(data=branch_mu_df, x="mu", col="nu", hue= col_wrap=3, log_scale=True)#, kind="kde")
+        g = sns.PairGrid(branch_mu_df.drop("summed_mu", axis=1), hue="nu")
+        g.map_diag(sns.histplot)
+        g.map_offdiag(sns.scatterplot, alpha=0.5)
+        g.add_legend()
+
+        plt.show()
+
+
+
         # beta = (np.log(mus) - np.log(muc)) / cherry_tau
-        rw_steps = [1e3, 1e4]
+        rw_steps = [1e3, 1e4, 1e5]
         # fixed_mu = np.random.uniform(muc, mus)
         cherry_species_tree = TreeNode.read([f"(A:{cherry_tau/2},B:{cherry_tau/2});"])
-        fig, ax = plt.subplots()
-        fig2, ax2 = plt.subplots(len(list(cherry_species_tree.tips())), 1, figsize=(10, 10))
-        fig3, ax3 = plt.subplots()
-        for rw in rw_steps:
+        fig2, ax2 = plt.subplots(len(rw_steps), 1, figsize=(10, 15))
+        for i, rw in enumerate(rw_steps):
             rw_step = cherry_tau / rw
             print(f"rw : {rw}")
             cherries = generate_gene_trees(cherry_species_tree, 1000, muc, mus, rw_step=rw_step)
-            if not muc:
-                muc= np.min([np.min([tip.length for tip in cherry.tips()]) for cherry in cherries])/(cherry_tau/2)
-            print(f"empirical muc : {muc}")
-            for i, tip in enumerate(cherry_species_tree.tips()):
-                plot_mutation_rate_distribution(ax2[i], cherry_species_tree, tip.name, cherries, muc, mus, label=f"random walk steps ({rw:.0e})")
-            plot_distance_distribution(ax, cherry_species_tree, cherries, muc, mus, label=f"random walk steps ({rw:.0e})")
-            plot_rate_correlation(ax3, cherry_species_tree, cherries, "A", "B", muc, mus, label=f"random walk steps ({rw:.0e})")
+            tips_mut_rate = get_all_pair_mutation_rate(cherry_species_tree, cherries)
+            mean_mus = {}
+            for pair, dists in tips_mut_rate.items():
+                mean_mus[pair] = [(a + b)/2 for a, b in dists]
+            muc_mus = {pair: [min(muss), max(muss)] for pair, muss in mean_mus.items()}
+            # for i, tip in enumerate(cherry_species_tree.tips()):
+                # plot_mutation_rate_distribution(ax2[i], cherry_species_tree, tip.name, cherries, muc, mus, label=f"random walk steps ({rw:.0e})")
+            # def plot_distance_distribution(axs, species_tree, gene_trees, muc_mus, label="observed distribution", tree_dir=None):
 
-        ax.legend()
-        for ax in ax2:
-            ax.legend()
+            plot_distance_distribution(ax2[i], cherry_species_tree, cherries, muc_mus, label=f"random walk steps ({rw:.0e})")
+            # plot_rate_correlation(ax3, cherry_species_tree, cherries, "A", "B", muc, mus, label=f"random walk steps ({rw:.0e})")
+
+        fig2.tight_layout()
         plt.show()
+
+        fig2.savefig("distance_distrib_poster.png")
 
 
 
@@ -1201,16 +1261,10 @@ if __name__ == "__main__":
         tree_plot_dir = "test_tree_repr"
         n_combinations = len(list(itertools.combinations([tip.name for tip in time_tree.tips()], 2)))
 
-        # beta fraction test
-        fig, axs = plt.subplots(n_combinations, 2, figsize=(20, 20))
-        for bf in beta_fraction:
-            beta = (np.log(mus) - np.log(muc)) / bf / tree_height
-            gene_trees = generate_gene_trees(time_tree, 5000, muc, mus, beta=beta)
-            plot_distance_distribution(axs, time_tree, gene_trees, muc, mus, label=f"lognormal ({1/bf:.1f})", tree_dir=tree_plot_dir)
-        for ax in axs:
-            ax[1].legend()
-        fig.tight_layout()
-        fig.savefig("lognormal_rate_evolution.png", dpi=300)
+
+        
+
+
 
         # random walk test
         fig, axs = plt.subplots(n_combinations, 2, figsize=(20, 20))
@@ -1221,7 +1275,7 @@ if __name__ == "__main__":
         for ax in axs:
             ax[1].legend()
         fig.tight_layout()
-        fig.savefig("random_walk_rate_evolution.png", dpi=300)
+        fig.savefig("random_walk_rate_evolution2.png", dpi=300)
 
         # timestep/null model test
         fig, axs = plt.subplots(n_combinations, 2, figsize=(20, 20))
@@ -1239,15 +1293,14 @@ if __name__ == "__main__":
 
 
         # test random walk
-        n_rw = 1
-        muc = 6e-11
+        n_rw = 20
+        muc = 6e-13
         mus = 5e-9
         for _ in range(n_rw):
-            mean, rw, _ = random_walk(np.random.uniform(muc, mus), 1e4, 1e8, muc, mus, linear=False)
+            mean, rw, _ = random_walk(np.random.uniform(muc, mus), 1e5, 1e8, muc, mus, linear=False)
             plt.plot(rw)
-            plt.axhline(y=mean, color="green")
-            plt.axhline(y=mus, color="blue")
-            plt.axhline(y=muc, color="blue")
+        plt.axhline(y=mus, color="blue")
+        plt.axhline(y=muc, color="blue")
         plt.yscale("log")
         plt.savefig("random_walk_pres.png", dpi=300)
         plt.close()
@@ -1256,24 +1309,27 @@ if __name__ == "__main__":
         muc = 6e-11
         mus = 5e-9
         n_rw = 1e4
-        rw_steps_size = [1e2, 1e3, 1e4, 1e5]
+        rw_steps_size = [1e2, 1e3, 1e4]
         tau = 1e8
         fig, ax = plt.subplots()
         for rw_step in rw_steps_size:
             rw_distr = []
             for _ in range(int(n_rw)):
                 mean, rw, last_rw = random_walk(np.random.uniform(muc, mus), tau/rw_step, 1e8, muc, mus, linear=False)
-                rw_distr.append(mean)
-            bins = np.logspace(np.log10(muc), np.log10(mus), 30)
+                rw_distr.append(np.exp(last_rw))
+            bins = np.logspace(np.log(muc), np.log(mus), 30, base=np.exp(1))
+            hist, _ = np.histogram(rw_distr, bins=bins)#, density=True)
             bins_centers = np.sqrt(bins[1:]*bins[:-1])
-            hist, _ = np.histogram(rw_distr, bins=bins, density=True)
-            ax.plot(bins_centers, hist, label=f"number of steps : {rw_step:.0e}")
+            hist_norm = hist/(bins[1:] - bins[:-1])
+            ax.plot(bins_centers, hist_norm, label=f"number of steps : {rw_step:.0e}")
+            # ax.plot(bins[:-1], hist, label=f"number of steps : {rw_step:.0e}")
         ax.legend()
+
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlabel("Mutation rate")
         ax.set_ylabel("Density")
-        fig.savefig("random_walk_mean_distr.png", dpi=300)
+        # fig.savefig("random_walk_mean_distr.png", dpi=300)
         plt.show()
 
         # exp muc random walk distr
@@ -1471,19 +1527,6 @@ if __name__ == "__main__":
         fig.savefig("normal_vs_rw_log.png", dpi=300)
 
 
-
-
-
-
-
-       
-
-
-
-
-
-
-
         # test plot_distance_distribution for rw corr 1e5 steps
         fig, ax = plt.subplots(1, 1, figsize=(10, 10))
         for i, steps in enumerate([3]):
@@ -1503,3 +1546,54 @@ if __name__ == "__main__":
 
             plot_distance_distribution(ax, time_tree, gene_trees, muc, mus)
 
+
+        # test inner nodes instant distributions (sanity check) -> Works in linear
+        tree = TreeNode.read(["(A:2,(B:1,C:1):1);"])
+        print(tree.ascii_art())
+        tree_height = 1e8
+        muc = 6e-13
+        mus = 1e-9
+        rw_step_fraction = [1e4]
+        time_tree = get_time_tree(tree, tree_height)
+        n = 1000
+        threads=2
+        mutation_rate_fun = get_random_walk_tree
+
+        for rwf in rw_step_fraction:
+            rw_step = tree_height / rwf
+            gene_trees = [tree.copy() for _ in range(n)]
+            fun_args = [gene_trees, [rw_step]*n, np.random.uniform(muc, mus, n), [muc] * n, [mus] * n, [True] * n]
+            # fun_args = [gene_trees, [rw_step]*n, 10**(np.random.uniform(np.log10(muc), np.log10(mus), n)), [muc] * n, [mus] * n, [True] * n]
+            both_rate_trees = map(mutation_rate_fun, *fun_args)
+            instant_rate_trees = [irt for _, irt in both_rate_trees]
+            tips = sorted([tip.name for tip in tree.tips()])
+            tips_pairs = list(itertools.combinations(tips, 2))
+            dedup_lca = {}
+            instant_rates = {pair: [] for pair in tips_pairs}
+            for tip_1, tip_2 in tips_pairs:
+                for rate_tree in instant_rate_trees:
+                    lca_tree = rate_tree.lca([rate_tree.find(tip_1), rate_tree.find(tip_2)])
+                    instant_rates[(tip_1, tip_2)].append(lca_tree.length)
+
+
+            # plotting
+            fig, ax = plt.subplots()
+            mu = np.linspace(muc, mus, 100)
+            pdf = linear_pdf(mu, muc, mus)
+            pdf_log = np.where((mu >= muc) & (mu <= mus), np.log(mu)/(mu*(np.log(mus)**2 - np.log(muc)**2)), 0)
+            pdf_uniform = np.where((mu >= muc) & (mu <= mus), 1/(mus - muc), 0)
+            ax.plot(mu, pdf, color="green", label="linear pdf")
+            ax.plot(mu, pdf_uniform, color="red", label="uniform pdf")
+            # bins = np.logspace(np.log10(muc), np.log10(mus), 20)
+            bins = np.linspace(muc, mus, 20)
+            # bins_centers = np.sqrt(bins[1:] * bins[:-1])
+            for tip_1, tip_2 in tips_pairs:
+                hist, _ = np.histogram(instant_rates[(tip_1, tip_2)], bins=bins, density=True)
+                # ax.scatter(bins_centers, hist, label=f"{tip_1} vs {tip_2}, {rwf}", alpha=0.5)
+                ax.scatter(bins[:-1], hist, label=f"{tip_1} vs {tip_2}, {rwf}", alpha=0.5)
+                ax.set_xlabel("instant mutation rate at LCA")
+                ax.set_ylabel("Density")
+                # ax.set_xscale("log")
+                # ax.set_yscale("log")
+                ax.legend()
+            fig.savefig("lca_instant_rate_3leafed_A_outgroup_liiiiin.png", dpi=300)

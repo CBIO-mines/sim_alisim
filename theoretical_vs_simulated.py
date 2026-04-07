@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sys
-sys.path.append("/home/paulimer/Documents/tools/CoreSimul/jc_correction")
-from calc import theoretical_mld, integrand
+# sys.path.append("/home/paulimer/Documents/tools/CoreSimul/jc_correction")
+# from calc import theoretical_mld, integrand
 
 ALIGNER_DELTA = {
     "lastz": 0.82,
@@ -49,6 +49,7 @@ def plot_pred_sim(ax, binned_mld, aligner, param_tau, muc, mus, L0):
     ax.legend()
     ax.set_title(f"aligner: {aligner}, tau: {param_tau:.1e}")
 
+
 def plot_all_params(binned_mlds, params, muc, mus, L0):
     "plots a grid for every instance of parameter of the simulation and inference"
     # comment écrire une fonction hyper générale pour un problème spécifique 👍 
@@ -64,7 +65,7 @@ def plot_all_params(binned_mlds, params, muc, mus, L0):
 
     if len(num_params) == 1:
         num_params.append(1)
-    fig, axs = plt.subplots(num_params[0], num_params[1], layout="constrained", figsize=(num_params[0]*5, num_params[1]*5))
+    fig, axs = plt.subplots(num_params[0], num_params[1], layout="constrained", figsize=(num_params[1]*5, num_params[0]*5))
     for ax, param_dic  in zip(axs.flat, params_settings_dics):
         aligner = param_dic["aligner"]
         param_tau = 2*param_dic["tree_height"]

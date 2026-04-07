@@ -3,7 +3,9 @@
 """Functions to measure and plot the performance of the inference relative to the simulation parameters."""
 
 import argparse
+from io import StringIO
 import os
+import shlex
 import subprocess as sp
 import tempfile as tmp
 
@@ -54,7 +56,7 @@ def dot_plot_steps(all_res_df):
     for i, ax in enumerate(axes):
         ax.plot([0, 1], [0, 1], transform=ax.transAxes)
     g.add_legend()
-    g.savefig("dotplot_by_steps.png", dpi=300)
+    g.savefig("dotplot_by_steps_mean.png", dpi=300)
 
 
 def distr_exp_mu(all_res_df, fixed_muc, fixed_mus):
@@ -69,19 +71,6 @@ def distr_exp_mu(all_res_df, fixed_muc, fixed_mus):
     g.savefig("boxplots_mus.png", dpi=300)
 
 
-def add_mash(all_res_df, data_path):
-    """Adds mash as a distance measure for comparisons."""
-    all_dirs_data = [os.path.join(data_path, d) for d in os.listdir() if d.startswith("rw")]
-    for d in all_dirs_data:
-        rw_step_fraction = float(os.path.split(d)[1][-5:])
-        d_df = all_res_df[all_res_df["rw_step_fraction"] == rw_step_fraction]
-        with tmp.TemporaryFile() as gen_list:
-            genome_files = [os.path.join(d, g) for g in os.listdir(d) if g.endswith("fasta")]
-            gen_list.write("\n".join(genome_files))
-            sp.run(["mash triangle -p 40 -s 100000 -l", gen_list.name])
-
-
-
 
 
 def violin_steps(all_res_df):
@@ -89,42 +78,8 @@ def violin_steps(all_res_df):
     g = sns.FacetGrid(all_res_df, col="rw_step_fraction", col_wrap=4)
     g.map_dataframe(sns.boxplot, y="relative_error")
     g.set(ylabel="Relative error", xlabel="Steps from root to leaf", ylim=0)
-    g.savefig("relative_error_boxplot.png")
+    g.savefig("relative_error_boxplot_mean.png")
 
-
-def make_upgma(res_df):
-    tau_df = res_df[["genome_1", "genome_2", "fit_tau"]]
-    tau_matrix = pd.DataFrame(np.concatenate([tau_df.values, tau_df.values[:, [1,0,2]]])).pivot(columns=0,index=1,values=2).fillna(0)
-    dist_matrix = DistanceMatrix(tau_matrix, ids=tau_matrix.columns)
-    tree_upgma = upgma(dist_matrix)
-    return tree_upgma
-
-
-def re_vs_mu_range(all_res_df):
-    """Plots the performance (relative error) against the range of the distribution of mutation rates."""
-    all_res_df["range_mu"] = all_res_df["empirical_mus"] / all_res_df["empirical_muc"]
-    all_res_df["relative_error"] = all_res_df.apply(row_re, axis=1)
-    all_res_df["rw_step_fraction"] = all_res_df["rw_step_fraction"].astype(float).astype(int)
-    min_steps = all_res_df["nb_steps"].min()
-    max_steps = all_res_df["nb_steps"].max()
-    num_step_group = all_res_df.groupby("rw_step_fraction")
-    fig, ax = plt.subplots(figsize=(10, 10))
-    for i, gk in enumerate(num_step_group.groups.keys()):
-        rw_step_df = num_step_group.get_group(gk).copy()
-        sc = ax.scatter(rw_step_df["range_mu"],
-                   rw_step_df["relative_error"],
-                   c=rw_step_df["nb_steps"],
-                   cmap="viridis",
-                   vmin=min_steps,
-                   vmax=max_steps
-                   )
-    ax.legend()
-    ax.set_xlabel("Mu Distribution Range")
-    ax.set_ylabel("Relative Error")
-    ax.set_xscale("log")
-    fig.colorbar(sc, ax=ax, label='nb_steps')
-    fig.tight_layout()
-    fig.savefig("error_vs_range.png", dpi=300)
 
 
 def plot_r2(r2_df):
@@ -134,7 +89,52 @@ def plot_r2(r2_df):
     ax.scatter(r2_df["rw_step"], r2_df["r2"])
     ax.set_xlabel("Steps amount to cover tree height")
     ax.set_ylabel("R2")
-    fig.savefig("r2_vs_steps.png", dpi=300)
+    fig.savefig("r2_vs_steps_mean.png", dpi=300)
+
+
+def add_mash(all_res_df, data_path):
+    """Adds mash as a distance measure for comparisons."""
+    all_dirs_data = [os.path.join(data_path, d) for d in os.listdir(data_path) if d.startswith("rw")]
+    res_list_w_mash = []
+    for d in all_dirs_data:
+        rw_step_fraction = float(os.path.split(d)[1][-5:])
+        d_df = all_res_df[all_res_df["rw_step_fraction"] == rw_step_fraction]
+        genome_files = [os.path.join(d, g) for g in os.listdir(d) if g.endswith("fasta")]
+        mash_cmd_str = f"mash triangle -p 10 -s 100000 -E {' '.join(genome_files)}"
+        mash_cmd = shlex.split(mash_cmd_str)
+        mash_res = sp.run(mash_cmd, capture_output=True, check=True, encoding="utf-8")
+
+        mash_df = pd.read_csv(StringIO(mash_res.stdout), sep="\t", header=None, names=["genome_1", "genome_2", "mash_dist", "pval", "shared_hashes"])
+        mash_df["genome_1"] = mash_df["genome_1"].apply(lambda x: os.path.splitext(os.path.basename(x))[0])
+        mash_df["genome_2"] = mash_df["genome_2"].apply(lambda x: os.path.splitext(os.path.basename(x))[0])
+        mash_df[["genome_1", "genome_2"]] = mash_df.apply(lambda x: (x.genome_1, x.genome_2) if x.genome_1 < x.genome_2 else (x.genome_2, x.genome_1), axis=1, result_type="expand")
+        res_list_w_mash.append(pd.merge(d_df, mash_df, "inner", on=["genome_1", "genome_2"]))
+
+    res = pd.concat(res_list_w_mash)
+    return res
+
+
+# ok mash is better
+def mash_vs_mosaic(res_df, also_fixed=False):
+    """Plots the mash distance against the mosaic distance."""
+    if also_fixed:
+        plot_df = res_df[["mash_dist", "rw_step_fraction", "sim_tau", "fit_tau"]]
+    else:
+        plot_df = res_df[res_df["empirical"] == True][["mash_dist", "rw_step_fraction", "sim_tau", "fit_tau"]].drop_duplicates()
+    scaler = sk.preprocessing.MinMaxScaler()
+    scaled = scaler.fit_transform(plot_df[["mash_dist", "fit_tau", "sim_tau"]])
+    plot_df[["mash_dist", "fit_tau", "sim_tau"]] = scaled
+    plot_df = plot_df.melt(id_vars=["rw_step_fraction", "sim_tau"], value_vars = ["fit_tau", "mash_dist"], value_name="normalized estimated distance", var_name="method")
+    g = sns.FacetGrid(data=plot_df, col="rw_step_fraction", col_wrap=4)#, hue="empirical")
+    g.map_dataframe(sns.scatterplot, x="sim_tau", y="normalized estimated distance", hue="method")#, c="nb_steps")#, cmap="viridis", vmin=min_steps, vmax=max_steps, alpha=0.5)
+    axes = g.axes.flatten()
+    for i, ax in enumerate(axes):
+        ax.plot([0, 1], [0, 1], transform=ax.transAxes)
+    g.add_legend()
+    plt.show()
+
+
+
 
 
 def refit_fixed_mus(all_res_df, res_path, muc, mus, delta, genome_length):
@@ -175,11 +175,21 @@ def fit_refit_distance(all_res_df):
     #     ax.scatter(rw_step_df["sim_tau"], rw_step_df["refit_relative_error"]
     g = sns.FacetGrid(all_res_df, col="rw_step_fraction", col_wrap=4)
     g.map(sns.boxplot, "empirical", "relative_error")
-    g.savefig("fit_refit_distance.png", dpi=300)
+    g.savefig("fit_refit_distance_mean.png", dpi=300)
 
 
-def RF_stepsize(all_res_df, ori_tree):
+def make_upgma(res_df):
+    tau_df = res_df[["genome_1", "genome_2", "fit_tau"]]
+    tau_matrix = pd.DataFrame(np.concatenate([tau_df.values, tau_df.values[:, [1,0,2]]])).pivot(columns=0,index=1,values=2).fillna(0)
+    dist_matrix = DistanceMatrix(tau_matrix, ids=tau_matrix.columns)
+    tree_upgma = upgma(dist_matrix)
+    return tree_upgma
+
+
+# always 0 anyways
+def RF_stepsize(all_res_df, ori_tree_str):
     """Computes the RF distance as a function of the parameter size"""
+    ori_tree = TreeNode.read([ori_tree_str])
     empirical_df = all_res_df[all_res_df["empirical"] == True]
     fixed_df = all_res_df[all_res_df["empirical"] == False]
     dfs = {True: empirical_df, False: fixed_df}
@@ -201,16 +211,45 @@ def plot_RF(all_res_df, also_fixed=False):
     if also_fixed:
         plot_df = all_res_df[["RF distance", "empirical", "rw_step_fraction"]].drop_duplicates()
     else:
-        plot_df = all_res_df[all_res_df["empirical" == True]][["RF distance", "empirical", "rw_step_fraction"]].drop_duplicates()
+        plot_df = all_res_df[all_res_df["empirical"] == True][["RF distance", "empirical", "rw_step_fraction"]].drop_duplicates()
     fig, ax = plt.subplots()
     exp_group = plot_df.groupby("empirical")
-    for exp in exp_group.keys():
-        group_df = exp_group.get_group(exp)
+    for exp, group_df in exp_group:
         ax.plot(group_df["rw_step_fraction"], group_df["RF distance"], label=exp)
     ax.legend()
     fig.tight_layout()
     plt.show()
 
+
+# pas super utile
+def re_vs_mu_range(all_res_df, also_fixed=False):
+    """Plots the performance (relative error) against the range of the distribution of mutation rates."""
+    if also_fixed:
+        plot_df = all_res_df[["muc", "mus", "rw_step_fraction", "nb_steps", "relative_error"]]
+    else:
+        plot_df = all_res_df[all_res_df["empirical"] == True][["muc", "mus", "rw_step_fraction", "nb_steps", "relative_error"]]
+
+    plot_df["range_mu"] = plot_df["mus"] / plot_df["muc"]
+    plot_df["rw_step_fraction"] = plot_df["rw_step_fraction"].astype(float).astype(int)
+    min_steps = plot_df["nb_steps"].min()
+    max_steps = plot_df["nb_steps"].max()
+    num_step_group = plot_df.groupby("rw_step_fraction")
+    fig, ax = plt.subplots(figsize=(10, 10))
+    for _, step_df in num_step_group:
+        sc = ax.scatter(step_df["range_mu"],
+                   step_df["relative_error"],
+                   c=step_df["nb_steps"],
+                   cmap="viridis",
+                   vmin=min_steps,
+                   vmax=max_steps
+                   )
+    ax.legend()
+    ax.set_xlabel("Mu Distribution Range")
+    ax.set_ylabel("Relative Error")
+    ax.set_xscale("log")
+    fig.colorbar(sc, ax=ax, label='nb_steps')
+    fig.tight_layout()
+    fig.savefig("error_vs_range_mean.png", dpi=300)
 
 
 

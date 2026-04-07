@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import shutil
 
 import argparse
 import concurrent.futures
@@ -22,7 +23,8 @@ SERVER_MODE = False
 RATE_EVOLUTION_DIC = {
     "random_walk": "rw_step_fraction",
     "kishino": "nu",
-    "none": "none"
+    "none": "none",
+    "null": "none"
 }
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -42,6 +44,9 @@ from lastz_parallel_db import utils as lastz_utils
 
 
 # TODO: concatenate all binned mld in a single df/csv, all the db in a single db, etc
+def to_list(x):
+    """Convert x to a list: wrap non-lists, return copy of lists."""
+    return [x] if not isinstance(x, list) else list(x)
 
 def inf_add_suffix(inference_cfg, suffix):
     for key in inference_cfg:
@@ -126,8 +131,8 @@ def simplified_parsing(cfg, genomes_dir=None, cherry_inf=False):
     levels = list(itertools.combinations(level_list, 2))
     binned_mlds = {}
     for level in levels:
-        genome_comps = parse_fun.get_genome_comp(level, cfg["taxon_csv"], "", cfg["cluster_name"], output_csv=False)
-        full_mld = parse_fun.get_all_mlds(genome_comps, database_path, threads=2)
+        genome_comps = parse_fun.get_genome_comp(level, taxon_df, cfg["cluster_name"])
+        full_mld = parse_fun.get_all_mlds(genome_comps, database_path)
         summed_mld = parse_fun.sum_mlds(full_mld)
         binned_mld = parse_fun.bin_mld(
             summed_mld,
@@ -225,25 +230,28 @@ def plot_mld_fit_and_expected(fitted_params, binned_mld, ax, empirical_muc, empi
         plt.savefig(outfile)
     return {"genome_1": level[0], "genome_2": level[1], "fit_tau": fitted_params[0], "sim_tau": simulated_params[0], "empirical_muc": empirical_muc, "empirical_mus": empirical_mus}
 
-def simulate_infer(simulation_cfg, inference_cfg, tree_heights):
+def simulate_infer(simulation_cfg, inference_cfg):
     rate_evolution_parameter = RATE_EVOLUTION_DIC[simulation_cfg["rate_evolution"]]
+    tree_heights = to_list(simulation_cfg["tree_height"])
+    tree_heights = [float(th) for th in tree_heights]
     if rate_evolution_parameter == "none":
         rate_params = ["none"]
     else:
         rate_params = simulation_cfg[rate_evolution_parameter].copy()
     all_res_df_list = []
-    aligners = inference_cfg["aligner"].copy()
+    aligners = to_list(inference_cfg["aligner"])
+    tmpdir = os.getenv("TMPDIR", default=simulation_cfg["outdir"])
     configs = [{"tree_height": th, "aligner": al, rate_evolution_parameter: rep} \
                for th, al, rep in itertools.product(tree_heights, aligners, rate_params)]
-    file_names = [{"db_name":f"{simulation_cfg['outdir']}/dbs/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}.db",\
-                   "binned_mld_name":f"{simulation_cfg['outdir']}/binned_mlds/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_binned_mld/",\
-                   "fit_expected_name":f"{simulation_cfg['outdir']}/fit_expected_fig/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_fit_expected.png",\
-                   "genomes_dir":f"{simulation_cfg['outdir']}/genomes/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_genomes/"} \
+    file_names = [{"db_name":f"{tmpdir}/dbs/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}.db",\
+                   "binned_mld_name":f"{tmpdir}/binned_mlds/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_binned_mld/",\
+                   "fit_expected_name":f"{tmpdir}/fit_expected_fig/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_fit_expected.png",\
+                   "genomes_dir":f"{tmpdir}/genomes/{conf['tree_height']:.2e}_{conf['aligner']}_{rate_evolution_parameter}_{conf[rate_evolution_parameter]}_genomes/"} \
                   for conf in configs]
-    os.makedirs(os.path.join(simulation_cfg["outdir"], "dbs"), exist_ok=True)
-    os.makedirs(os.path.join(simulation_cfg["outdir"], "binned_mlds"), exist_ok=True)
-    os.makedirs(os.path.join(simulation_cfg["outdir"], "fit_expected_fig"), exist_ok=True)
-    os.makedirs(os.path.join(simulation_cfg["outdir"], "genomes"), exist_ok=True)
+    os.makedirs(os.path.join(tmpdir, "dbs"), exist_ok=True)
+    os.makedirs(os.path.join(tmpdir, "binned_mlds"), exist_ok=True)
+    os.makedirs(os.path.join(tmpdir, "fit_expected_fig"), exist_ok=True)
+    os.makedirs(os.path.join(tmpdir, "genomes"), exist_ok=True)
     binned_mld_dic_of_dics = {}
 
     species_tree = TreeNode.read([simulation_cfg["species_tree"]])
@@ -333,7 +341,7 @@ def simulate_infer(simulation_cfg, inference_cfg, tree_heights):
         # plotting
         plot_res = []
         for pair, (binned_mld, res_opt, pair) in res_fit.items():
-            plot_res.append(plot_mld_fit_and_expected(
+            res_dic = plot_mld_fit_and_expected(
                 res_opt.x,
                 binned_mld,
                 ax2_list[pair],
@@ -346,7 +354,9 @@ def simulate_infer(simulation_cfg, inference_cfg, tree_heights):
                 None,
                 None,
                 True
-            ))
+            )
+            opt_value_dic = {"minimum": res_opt.fun}
+            plot_res.append(res_dic | opt_value_dic)
         fig_fe.tight_layout()
         fig_fe.savefig(names["fit_expected_name"], dpi=300)
         plt.close()
@@ -361,7 +371,7 @@ def simulate_infer(simulation_cfg, inference_cfg, tree_heights):
             print(res_fit_df)
 
     all_res_fit_df = pd.concat(all_res_df_list).reset_index(drop=True)
-    all_res_fit_df.to_csv(os.path.join(simulation_cfg["outdir"], "all_res_fit.csv"), index=False)
+    all_res_fit_df.to_csv(os.path.join(tmpdir, "all_res_fit.csv"), index=False)
     all_binned_mlds = []
     for conf, binned_mld_dic in binned_mld_dic_of_dics.items():
         conf_binned_mld = []
@@ -374,17 +384,12 @@ def simulate_infer(simulation_cfg, inference_cfg, tree_heights):
             conf_binned_mld_df[param] = value
         all_binned_mlds.append(conf_binned_mld_df)
     all_binned_mlds_df = pd.concat(all_binned_mlds).reset_index(drop=True)
-    all_binned_mlds_df.to_csv(os.path.join(simulation_cfg["outdir"], "all_binned_mlds.csv"), index=False)
+    all_binned_mlds_df.to_csv(os.path.join(tmpdir, "all_binned_mlds.csv"), index=False)
+
+    if tmpdir != simulation_cfg["outdir"]:
+        shutil.copytree(tmpdir, simulation_cfg["outdir"], dirs_exist_ok=True)
             
 
-
-def main(simulation_cfg, inference_cfg):
-    if type(simulation_cfg["tree_height"]) is list:
-        tree_heights = simulation_cfg["tree_height"].copy()
-        tree_heights = [float(tree_height) for tree_height in tree_heights]
-    else:
-        tree_heights = [float(simulation_cfg["tree_height"])]
-    simulate_infer(simulation_cfg, inference_cfg, tree_heights)
 
 
 if __name__ == "__main__":
@@ -398,9 +403,15 @@ if __name__ == "__main__":
     with open(args.inference_cfg, "r") as f:
         inference_cfg = yaml.safe_load(f)
 
+    # copy the configs to the output directories
+    os.makedirs(simulation_cfg["outdir"], exist_ok=True)
+    if not os.path.exists(args.simulation_cfg):
+        shutil.copy(args.simulation_cfg, simulation_cfg["outdir"])
+        shutil.copy(args.inference_cfg, simulation_cfg["outdir"])
+
     tracemalloc.start()
     with cProfile.Profile() as pr:
-        main(simulation_cfg, inference_cfg)
+        simulate_infer(simulation_cfg, inference_cfg)
         pstats.Stats(pr).sort_stats("cumtime").print_stats(50)
     snapshot = tracemalloc.take_snapshot()
     top_stats = snapshot.statistics('lineno')
