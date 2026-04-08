@@ -18,8 +18,6 @@ import pandas as pd
 from skbio import TreeNode
 import yaml
 
-SERVER_MODE = False
-
 RATE_EVOLUTION_DIC = {
     "random_walk": "rw_step_fraction",
     "kishino": "nu",
@@ -27,27 +25,15 @@ RATE_EVOLUTION_DIC = {
     "null": "none"
 }
 
-script_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(script_dir)
-if SERVER_MODE:
-    mosaic_method_path = "/project/bacteria_mlds/test_florian/"
-else:
-    mosaic_method_path = "/home/paulimer/Documents/test_florian/"
-
-sys.path.append(mosaic_method_path)
-import gene_trees as gt
-from theoretical_vs_simulated import ALIGNER_DELTA
-from fitting.fun import theoretical_mld, fit_params
-from parse.fun import bin_mld
-from parse import fun as parse_fun
-from lastz_parallel_db import utils as lastz_utils
+from sim_alisim.gene_trees import get_time_tree, run_simulation, get_all_pair_mutation_rate, to_list
+from sim_alisim.theoretical_vs_simulated import ALIGNER_DELTA
+from mosaic_method.fitting import theoretical_mld, fit_params
+from mosaic_method.parsing import get_genome_comp, get_all_mlds, sum_mlds, bin_mld
+from mosaic_method.aligning import align_exec, create_lastz_db
 
 
 # TODO: concatenate all binned mld in a single df/csv, all the db in a single db, etc
-def to_list(x):
-    """Convert x to a list: wrap non-lists, return copy of lists."""
-    return [x] if not isinstance(x, list) else list(x)
-
+#
 def inf_add_suffix(inference_cfg, suffix):
     for key in inference_cfg:
         if key.endswith("dir"):
@@ -80,10 +66,10 @@ def make_cherry_conf(simulation_cfg, inference_cfg, cherry, names):
 
 def cherries_inference(cfg, names):
     """Just get me the binned mld bro."""
-    align_res = lastz_utils.align_exec([cfg["genomes_dir"] + f"/{names[0]}.fasta", cfg["genomes_dir"] + f"/{names[1]}.fasta"], "lastz", "bla")
+    align_res = align_exec([cfg["genomes_dir"] + f"/{names[0]}.fasta", cfg["genomes_dir"] + f"/{names[1]}.fasta"], "lastz", "bla")
     unbinned_mld = align_res[2]["result"][0]
     summed_mld = pd.DataFrame({"freq":unbinned_mld}, index=range(1, len(unbinned_mld) + 1)).reset_index(names="match_length")
-    binned_mld = parse_fun.bin_mld(
+    binned_mld = bin_mld(
             summed_mld,
             linear_bin_width=3,
             limit_size=30.5,
@@ -94,7 +80,7 @@ def cherries_inference(cfg, names):
 
 
 
-def simplified_parsing(cfg, genomes_dir=None, cherry_inf=False):
+def simplified_parsing(cfg, cherry_inf=False):
     """
     Aligns, gathers MLDs and bins them.
     """
@@ -113,7 +99,7 @@ def simplified_parsing(cfg, genomes_dir=None, cherry_inf=False):
         update_db = True
     else:
         update_db = False
-    con = lastz_utils.create_lastz_db(
+    con = create_lastz_db(
         cfg["taxon_csv"],
         masked_genomes_dir,
         cfg["cluster_name"],
@@ -131,10 +117,10 @@ def simplified_parsing(cfg, genomes_dir=None, cherry_inf=False):
     levels = list(itertools.combinations(level_list, 2))
     binned_mlds = {}
     for level in levels:
-        genome_comps = parse_fun.get_genome_comp(level, taxon_df, cfg["cluster_name"])
-        full_mld = parse_fun.get_all_mlds(genome_comps, database_path)
-        summed_mld = parse_fun.sum_mlds(full_mld)
-        binned_mld = parse_fun.bin_mld(
+        genome_comps = get_genome_comp(level, taxon_df, cfg["cluster_name"])
+        full_mld = get_all_mlds(genome_comps, database_path)
+        summed_mld = sum_mlds(full_mld)
+        binned_mld = bin_mld(
             summed_mld,
             linear_bin_width=3,
             limit_size=30.5,
@@ -155,14 +141,13 @@ def simplified_parsing(cfg, genomes_dir=None, cherry_inf=False):
         )
 
 
-def fit_mld(binned_mld, empirical_muc, empirical_mus, delta, genome_length, level, minus_4=True):
+def fit_mld(binned_mld, empirical_muc, empirical_mus, delta, genome_length, level, optim_method="dual_annealing"):
     "Fits the mosaic model, returns the results of the optimisation."
     print("OPENBLAS_NUM_THREADS", os.environ.get("OPENBLAS_NUM_THREADS"))
     t0 = time.perf_counter()
     # mus and muc are different for each comp, need to refit here
-    res_opt, _, res_opt_4 = fit_params(
-        "dual-annealing",
-        # "L-BFGS-B",
+    _, _, res_opt_4 = fit_params(
+        optim_method,
         np.array([9, -8]),
         binned_mld["freq"],
         0.1,
@@ -174,10 +159,7 @@ def fit_mld(binned_mld, empirical_muc, empirical_mus, delta, genome_length, leve
         only_minus4=True
         )
     print(f"task done in{time.perf_counter() -t0}")
-    if minus_4:
-        return binned_mld, res_opt_4, level
-    else:
-        return binned_mld, res_opt, level
+    return binned_mld, res_opt_4, level
 
 
 def plot_mld_fit_and_expected(fitted_params, binned_mld, ax, empirical_muc, empirical_mus, delta, simulated_params, genome_length, level, save_res=None, outfile=None, plotminus4=True):
@@ -260,7 +242,7 @@ def simulate_infer(simulation_cfg, inference_cfg):
         print("################################################")
         print(f"Currently working on {conf}")
         print("################################################")
-        time_tree = gt.get_time_tree(species_tree, conf["tree_height"])
+        time_tree = get_time_tree(species_tree, conf["tree_height"])
         fig_fe, ax_fe = plt.subplots(n_combinations, 2, figsize=(10, 5*n_combinations))
         if inference_cfg["also_cherries"] == "yes":
             res_cherries = []
@@ -269,7 +251,7 @@ def simulate_infer(simulation_cfg, inference_cfg):
                 cherry_names = sorted([tip.name for tip in cherry.tips()])
                 cherry_sim_conf, cherry_inf_conf = make_cherry_conf(simulation_cfg_copy, inference_cfg_copy, cherry, cherry_names)
                 # print(cherry_sim_conf)
-                tips_mut_rate_cherry = gt.run_simulation(cherry_sim_conf)
+                tips_mut_rate_cherry = run_simulation(cherry_sim_conf)
                 # urgh c'est laid
                 summed_mus_cherry = [(a + b)/2 for a, b in tips_mut_rate_cherry[next(iter(tips_mut_rate_cherry))]]
                 binned_mld = cherries_inference(cherry_inf_conf, cherry_names)
@@ -278,10 +260,9 @@ def simulate_infer(simulation_cfg, inference_cfg):
                                     np.max(summed_mus_cherry),
                                     cherry_inf_conf["delta"],
                                     cherry_sim_conf["n_gene_trees"] * cherry_sim_conf["length_gene"],
-                                    " ".join(cherry_names),
-                                    True
+                                    " ".join(cherry_names)
                                     )
-                cherry_time_tree = gt.get_time_tree(cherry, cherry_sim_conf["tree_height"])
+                cherry_time_tree = get_time_tree(cherry, cherry_sim_conf["tree_height"])
                 cherry_1 = cherry_time_tree.find(cherry_names[0])
                 cherry_2 = cherry_time_tree.find(cherry_names[1])
                 sim_tau_cherry = cherry_1.distance(cherry_2)
@@ -296,7 +277,7 @@ def simulate_infer(simulation_cfg, inference_cfg):
         simulation_cfg_copy["tree_height"] = conf["tree_height"]
         simulation_cfg_copy[rate_evolution_parameter] = conf[rate_evolution_parameter]
         simulation_cfg_copy["genomes_dir"] = names["genomes_dir"]
-        tips_mut_rate = gt.run_simulation(simulation_cfg_copy, ax_fe)
+        tips_mut_rate = run_simulation(simulation_cfg_copy, ax_fe)
 
         # parsing
         inference_cfg_copy = inference_cfg.copy()
@@ -326,13 +307,18 @@ def simulate_infer(simulation_cfg, inference_cfg):
             ax2_list = {pair: ax_fe[i, 1] for i, pair in enumerate(all_summed_mus.keys())}
 
         res_fit = {}
-        overall_args = [(binned_mld_dic_of_dics[key][pair],
-                         muc_list[pair],
-                         mus_list[pair],
-                         inference_cfg_copy["delta"],
-                         simulation_cfg_copy["length_gene"]*simulation_cfg_copy["n_gene_trees"],
-                         pair,
-                         True) for pair in all_summed_mus.keys()]
+        overall_args = [
+            (
+                binned_mld_dic_of_dics[key][pair],
+                muc_list[pair],
+                mus_list[pair],
+                inference_cfg_copy["delta"],
+                simulation_cfg_copy["length_gene"]*simulation_cfg_copy["n_gene_trees"],
+                pair,
+                inference_cfg_copy["optim"]
+            )
+            for pair in all_summed_mus.keys()
+        ]
         with concurrent.futures.ProcessPoolExecutor(max_workers=inference_cfg_copy["max_threads"]) as executor:
             futures = [executor.submit(fit_mld, *args) for args in overall_args]
             for future in concurrent.futures.as_completed(futures):
@@ -392,75 +378,48 @@ def simulate_infer(simulation_cfg, inference_cfg):
 
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the gene tree simulation and the inference")
-    parser.add_argument("simulation_cfg", help="Path to the simulation config file")
-    parser.add_argument("inference_cfg", help="Path to the inference config file")
-    args = parser.parse_args()
+if False:
+    # debug region
+    # simulation data
+    gene_trees = []
+    gene_tree_dir = "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/full_tree_rw/rw_v_rw_1.00e+04"
+    res_dir = "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/full_tree_rw/res_rw_v_rw_1.00e+04"
+    for _ in range(5000):
+        gene_trees.append(TreeNode.read(f"{gene_tree_dir}/gene_tree_{_}.newick"))
+    species_tree = TreeNode.read([f"(A:3,(B:2,(C:1,D:1):1):1);"])
+    level = ("A", "B")
+    tree_height = 2e8
+    time_tree = gt.get_time_tree(species_tree, tree_height)
+    sim_tau = time_tree.find(level[0]).distance(time_tree.find(level[1]))
 
-    with open(args.simulation_cfg, "r") as f:
-        simulation_cfg = yaml.safe_load(f)
-    with open(args.inference_cfg, "r") as f:
-        inference_cfg = yaml.safe_load(f)
-
-    # copy the configs to the output directories
-    os.makedirs(simulation_cfg["outdir"], exist_ok=True)
-    if not os.path.exists(args.simulation_cfg):
-        shutil.copy(args.simulation_cfg, simulation_cfg["outdir"])
-        shutil.copy(args.inference_cfg, simulation_cfg["outdir"])
-
-    tracemalloc.start()
-    with cProfile.Profile() as pr:
-        simulate_infer(simulation_cfg, inference_cfg)
-        pstats.Stats(pr).sort_stats("cumtime").print_stats(50)
-    snapshot = tracemalloc.take_snapshot()
-    top_stats = snapshot.statistics('lineno')
-    print("[ Top 10 ]")
-    for stat in top_stats[:10]:
-        print(stat)
-
-    if False:
-        # debug region
-        # simulation data
-        gene_trees = []
-        gene_tree_dir = "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/full_tree_rw/rw_v_rw_1.00e+04"
-        res_dir = "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/full_tree_rw/res_rw_v_rw_1.00e+04"
-        for _ in range(5000):
-            gene_trees.append(TreeNode.read(f"{gene_tree_dir}/gene_tree_{_}.newick"))
-        species_tree = TreeNode.read([f"(A:3,(B:2,(C:1,D:1):1):1);"])
-        level = ("A", "B")
-        tree_height = 2e8
-        time_tree = gt.get_time_tree(species_tree, tree_height)
-        sim_tau = time_tree.find(level[0]).distance(time_tree.find(level[1]))
-
-        all_paired_mut_rates_dic = gt.get_all_pair_mutation_rate(time_tree, gene_trees)
-        all_summed_mus = [(a + b)/2 for a, b in all_paired_mut_rates_dic[level]]
-        muc = np.min(all_summed_mus)
-        mus = np.max(all_summed_mus)
-        fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-        plot_mld_fit_and_expected(ax, res_dir, muc, mus, 0.82, (np.log10(sim_tau), -20), all_summed_mus, all_paired_mut_rates_dic[level], 5e6, level)
-        fig.show()
+    all_paired_mut_rates_dic = get_all_pair_mutation_rate(time_tree, gene_trees)
+    all_summed_mus = [(a + b)/2 for a, b in all_paired_mut_rates_dic[level]]
+    muc = np.min(all_summed_mus)
+    mus = np.max(all_summed_mus)
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+    plot_mld_fit_and_expected(ax, res_dir, muc, mus, 0.82, (np.log10(sim_tau), -20), all_summed_mus, all_paired_mut_rates_dic[level], 5e6, level)
+    fig.show()
 
 
 
-        # plot fit results vs input of simulation
-        res_csv = "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/full_tree_rw_height/all_res_fit.csv"
-        res_df = pd.read_csv(res_csv)
+    # plot fit results vs input of simulation
+    res_csv = "/home/paulimer/Documents/CoreSimul_rewrite/CoreAliSim/full_tree_rw_height/all_res_fit.csv"
+    res_df = pd.read_csv(res_csv)
 
-        res_df["fit_tau"] = res_df["fit_tau"].apply(lambda x: 10**x)
-        res_df["sim_tau"] = res_df["sim_tau"].apply(lambda x: 10**x)
-        min_tau = res_df["fit_tau"].min()
-        max_tau = res_df["fit_tau"].max()
+    res_df["fit_tau"] = res_df["fit_tau"].apply(lambda x: 10**x)
+    res_df["sim_tau"] = res_df["sim_tau"].apply(lambda x: 10**x)
+    min_tau = res_df["fit_tau"].min()
+    max_tau = res_df["fit_tau"].max()
 
-        fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-        for rw_step_fraction, df in res_df.groupby("rw_step_fraction"):
-            ax.plot(df["sim_tau"], df["fit_tau"], "o", label=rw_step_fraction)
-        ax.plot([min_tau, max_tau], [min_tau, max_tau], "k--")
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("Fitted tau")
-        ax.set_ylabel("Simulated tau")
-        ax.legend()
-        ax.set_title("Fitted tau vs simulated tau")
-        fig.tight_layout()
-        fig.savefig(os.path.join(os.path.dirname(res_csv), "fit_vs_sim.png"), dpi=300)
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+    for rw_step_fraction, df in res_df.groupby("rw_step_fraction"):
+        ax.plot(df["sim_tau"], df["fit_tau"], "o", label=rw_step_fraction)
+    ax.plot([min_tau, max_tau], [min_tau, max_tau], "k--")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Fitted tau")
+    ax.set_ylabel("Simulated tau")
+    ax.legend()
+    ax.set_title("Fitted tau vs simulated tau")
+    fig.tight_layout()
+    fig.savefig(os.path.join(os.path.dirname(res_csv), "fit_vs_sim.png"), dpi=300)

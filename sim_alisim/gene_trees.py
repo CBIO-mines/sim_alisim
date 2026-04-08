@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 # Trying to implement the same thing with monkey patching
-from simulate_infer import to_list
 
 import argparse
 import concurrent.futures
@@ -9,6 +8,7 @@ import itertools
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import numpy as np
+from numpy.random import default_rng
 import os
 import random
 import subprocess as sp
@@ -36,6 +36,11 @@ import yaml
 # TODO: the issue might be of correlation between A and B rates. But how ? there are enough steps in the random walk to make it uncorrelated
 # TODO: is the usage of .distance good in get average mutation rate ? It would be wrong in the case of the "mutation rate" tree
 # TODO: uncorrelated : ideas : white noise process (special case of gamma, Drummond 2006), Cox - Ingersoll - Ross process (lepage 2007), mixed relaxed clock (lartillot 2016), lognormal
+
+def to_list(x):
+    """Convert x to a list: wrap non-lists, return copy of lists."""
+    return [x] if not isinstance(x, list) else list(x)
+
 
 # Gene tree zone ---------------------------------------------------------------
 def get_time_tree(tree, total_time):
@@ -745,7 +750,7 @@ def plot_distance_distribution(axs, species_tree, gene_trees, muc_mus, label="ob
         # ax.text(0.5, 0.15, f"KS where : {ks_where:.2f}", transform=ax.transAxes)
 
 
-def run_alisim(gene_tree, outdir, length_gene, num):
+def run_alisim(gene_tree, outdir, length_gene, num, seed):
     """
     Create sequences from Alisim for a gene tree.
 
@@ -757,16 +762,25 @@ def run_alisim(gene_tree, outdir, length_gene, num):
         The output directory.
     num : int
         The index of the gene tree.
+    seed: int
+        Seed for this alisim run.
 
     Returns
     -------
     """
     os.makedirs(outdir, exist_ok=True)
-    output_prefix = f"{outdir}/gene_tree_{num}"
-    tree_path = f"{outdir}/gene_tree_{num}.newick"
+    output_prefix = os.path.join(outdir, f"gene_tree_{num}")
+    tree_path = os.path.join(outdir, f"gene_tree_{num}.newick")
     gene_tree.write(tree_path)
-    alisim_cmd = ["iqtree", "--alisim", output_prefix, "-t", tree_path, "-m", "JC", "--out-format", "fasta", "--length", str(length_gene)]
-    sp.run(alisim_cmd, check=True, capture_output=True)
+    # TODO why is seed obligatory now
+    alisim_cmd = ["iqtree3", "--alisim", output_prefix, "-t", tree_path, "-m", "JC", "--out-format", "fasta", "--length", str(length_gene), "--seed", str(seed)]
+    try:
+        sp.run(alisim_cmd, check=True, capture_output=True)
+    except sp.CalledProcessError as e:
+        print("Error with command")
+        print(" ".join(alisim_cmd))
+        raise sp.CalledProcessError
+
     os.remove(tree_path)
     os.remove(f"{tree_path}.log")
 
@@ -790,10 +804,11 @@ def run_alisim_trees(gene_trees, outdir, length_gene, threads=1):
     Returns
     -------
     """
+    rng = default_rng()
+    seeds = rng.choice(len(gene_trees)*2, size=len(gene_trees), replace=False)
     # run alisim
-
     with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as executor:
-        executor.map(run_alisim, gene_trees, itertools.repeat(outdir), itertools.repeat(length_gene), range(len(gene_trees)))
+        list(executor.map(run_alisim, gene_trees, itertools.repeat(outdir), itertools.repeat(length_gene), range(len(gene_trees)), seeds))
 
     # concatenate fasta
     # and create taxon_csv

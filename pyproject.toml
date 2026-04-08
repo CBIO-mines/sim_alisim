@@ -1,0 +1,6 @@
+[project]
+name = "sim_alisim"
+version = "0.1.0"
+
+[project.scripts]
+sim = "sim_alisim.__main__:main"
